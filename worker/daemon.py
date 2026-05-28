@@ -136,7 +136,7 @@ def deregister_worker(config: WorkerConfig) -> None:
         pass
 
 
-def call_inference(config: WorkerConfig, runtime: Runtime, prompt: str, max_tokens: int = 1200) -> dict[str, Any]:
+def call_inference(config: WorkerConfig, runtime: Runtime, prompt: str, max_tokens: int) -> dict[str, Any]:
     payload = {
         "worker_id": config.worker_id,
         "session_id": config.session_id,
@@ -190,6 +190,8 @@ def main() -> int:
         task_goal, problems = get_default_problems()
 
     steps_total = len(problems)
+    max_tokens = int(os.getenv("MAX_TOKENS", "1200"))
+    step_sleep = int(os.getenv("STEP_SLEEP_SECONDS", "5"))
 
     client = RelayCheckpointClient(config.supabase_url, config.supabase_key)
     try:
@@ -350,7 +352,7 @@ def main() -> int:
             runtime.next_problem = problem.prompt
 
             print(f"--- [{config.worker_id}] Step {problem.step_number}/{steps_total}: {problem.topic} ---")
-            result = call_inference(config, runtime, problem.prompt)
+            result = call_inference(config, runtime, problem.prompt, max_tokens)
             latency_ms = int(result.get("latency_ms") or 0)
             tokens_used = int(result.get("tokens_used") or 0)
             solution = str(result.get("response", "")).strip()
@@ -409,9 +411,9 @@ def main() -> int:
             solved_steps.add(problem.step_number)
 
             print("Checkpoint saved")
-            if problem.step_number < steps_total:
-                print("Sleeping 5 seconds...")
-                time.sleep(5)
+            if problem.step_number < steps_total and step_sleep > 0:
+                print(f"Sleeping {step_sleep} seconds...")
+                time.sleep(step_sleep)
 
         report = build_report(client, config.session_id)
         report_path = OUTPUT_DIR / f"final_report_{config.worker_id}_{config.session_id}.txt"

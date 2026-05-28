@@ -56,7 +56,7 @@ def status_cmd() -> None:
             str(row.get("session_id", "-")),
             str(row.get("worker_id", "-")),
             str(row.get("status", "-")),
-            f"{row.get('steps_completed', 0)}/{row.get('steps_total', 5)}",
+            f"{row.get('steps_completed', 0)}/{row.get('steps_total', '?')}",
             str(row.get("current_machine", "-")),
             str(row.get("inference_node", "-")),
         )

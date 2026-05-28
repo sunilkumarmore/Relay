@@ -103,7 +103,7 @@ def right_panel(client: RelayCheckpointClient) -> Panel:
             str(session.get("worker_id", "-")),
             str(session.get("session_id", "-")),
             str(session.get("status", "-")),
-            f"{session.get('steps_completed', 0)}/{session.get('steps_total', 5)}",
+            f"{session.get('steps_completed', 0)}/{session.get('steps_total', '?')}",
             str(session.get("current_machine", "-")),
         )
 

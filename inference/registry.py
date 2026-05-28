@@ -74,6 +74,8 @@ load_dotenv(os.getenv("ENV_FILE", ".env"))
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434").strip()
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3").strip() or "llama3"
 INFERENCE_NODE_ID = os.getenv("MACHINE_ID", socket.gethostname()).strip() or socket.gethostname()
+REGISTRY_PORT = int(os.getenv("REGISTRY_PORT", "8765"))
+MAX_TOKENS_DEFAULT = int(os.getenv("MAX_TOKENS", "1200"))
 
 ollama = OllamaClient(OLLAMA_HOST, OLLAMA_MODEL)
 
@@ -215,7 +217,7 @@ def inference_status() -> dict[str, Any]:
 
 
 def main() -> None:
-    uvicorn.run(app, host="0.0.0.0", port=8765)
+    uvicorn.run(app, host="0.0.0.0", port=REGISTRY_PORT)
 
 
 if __name__ == "__main__":
