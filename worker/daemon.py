@@ -3,10 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
-import signal
 import threading
 import time
 from typing import Any
+import uuid
 
 import requests
 from dotenv import load_dotenv
@@ -14,14 +14,13 @@ from dotenv import load_dotenv
 try:
     from .checkpoint_client import RelayCheckpointClient, RelayCheckpointError
     from .eviction_handler import EvictionManager, EvictionState
-    from .problems import PROBLEMS, get_problem
+    from .problems import get_default_problems, get_problem, load_problems_from_file
 except ImportError:
     from checkpoint_client import RelayCheckpointClient, RelayCheckpointError
     from eviction_handler import EvictionManager, EvictionState
-    from problems import PROBLEMS, get_problem
+    from problems import get_default_problems, get_problem, load_problems_from_file
 
 
-TASK_GOAL = "Solve 5 complex math and logic problems"
 ROOT_DIR = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = ROOT_DIR / "output"
 
@@ -55,8 +54,13 @@ def load_config() -> WorkerConfig:
     supabase_key = os.getenv("SUPABASE_KEY", "").strip()
     inference_registry = os.getenv("INFERENCE_REGISTRY", "").strip().rstrip("/")
     worker_id = os.getenv("WORKER_ID", "").strip()
-    session_id = os.getenv("SESSION_ID", "").strip()
     machine_id = os.getenv("MACHINE_ID", "").strip()
+
+    # SESSION_ID is optional — auto-generate one if not provided.
+    session_id = os.getenv("SESSION_ID", "").strip()
+    if not session_id:
+        session_id = str(uuid.uuid4())
+        print(f"No SESSION_ID set — generated: {session_id}")
 
     missing = [
         name
@@ -65,7 +69,6 @@ def load_config() -> WorkerConfig:
             "SUPABASE_KEY": supabase_key,
             "INFERENCE_REGISTRY": inference_registry,
             "WORKER_ID": worker_id,
-            "SESSION_ID": session_id,
             "MACHINE_ID": machine_id,
         }.items()
         if not value
@@ -94,7 +97,7 @@ def verify_registry(url: str) -> dict[str, Any]:
             " On Machine 1: Make sure registry is running\n"
             "   python inference/registry.py\n"
             " On Machine 2: Check INFERENCE_REGISTRY points to Machine 1 IP\n"
-            " Check Windows Firewall allows port 8765"
+            " Check firewall allows port 8765"
         )
         raise SystemExit(1) from exc
 
@@ -175,6 +178,19 @@ def main() -> int:
     config = load_config()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Load tasks — from TASK_FILE if set, otherwise use built-in demo problems.
+    task_file = os.getenv("TASK_FILE", "").strip()
+    if task_file:
+        try:
+            task_goal, problems = load_problems_from_file(task_file)
+            print(f"Loaded {len(problems)} steps from {task_file}")
+        except Exception as exc:
+            raise SystemExit(f"Failed to load TASK_FILE '{task_file}': {exc}") from exc
+    else:
+        task_goal, problems = get_default_problems()
+
+    steps_total = len(problems)
+
     client = RelayCheckpointClient(config.supabase_url, config.supabase_key)
     try:
         client.verify_connection()
@@ -188,8 +204,7 @@ def main() -> int:
             f"ERROR: Cannot connect to Ollama at {os.getenv('OLLAMA_HOST', 'http://localhost:11434')}\n"
             " Run: ollama serve\n"
             " Make sure Ollama binds to 0.0.0.0:\n"
-            "   set OLLAMA_HOST=0.0.0.0\n"
-            "   ollama serve"
+            "   OLLAMA_HOST=0.0.0.0 ollama serve"
         )
         return 1
 
@@ -207,8 +222,8 @@ def main() -> int:
     client.upsert_session(
         session_id=config.session_id,
         worker_id=config.worker_id,
-        task_goal=TASK_GOAL,
-        steps_total=5,
+        task_goal=task_goal,
+        steps_total=steps_total,
         steps_completed=steps_completed,
         status="in_progress",
         current_machine=config.machine_id,
@@ -247,25 +262,32 @@ def main() -> int:
         render_banner(
             "RESUMING FROM CHECKPOINT",
             [
-                f"Worker: {config.worker_id}",
-                f"Session: {config.session_id}",
-                f"Completed: {steps_completed} of 5",
-                f"Previous machine: {existing_state.get('machine_id') if existing_state else 'unknown'}",
-                f"Current machine: {config.machine_id}",
+                f"Worker:   {config.worker_id}",
+                f"Session:  {config.session_id}",
+                f"Task:     {task_goal}",
+                f"Progress: {steps_completed} of {steps_total}",
+                f"Previous: {existing_state.get('machine_id') if existing_state else 'unknown'}",
+                f"Current:  {config.machine_id}",
             ],
         )
     else:
         render_banner(
             "STARTING FRESH",
             [
-                f"Worker: {config.worker_id}",
+                f"Worker:  {config.worker_id}",
                 f"Session: {config.session_id}",
+                f"Task:    {task_goal}",
+                f"Steps:   {steps_total}",
                 f"Machine: {config.machine_id}",
                 f"Inference node: {inference_node}",
             ],
         )
 
     next_step = steps_completed + 1
+    next_problem_prompt = ""
+    if next_step <= steps_total:
+        next_problem_prompt = get_problem(problems, next_step).prompt
+
     runtime = Runtime(
         worker_id=config.worker_id,
         session_id=config.session_id,
@@ -273,7 +295,7 @@ def main() -> int:
         inference_node=inference_node,
         steps_completed=steps_completed,
         next_step_number=next_step,
-        next_problem=get_problem(next_step).prompt if next_step <= 5 else "",
+        next_problem=next_problem_prompt,
     )
 
     heartbeat_stop = threading.Event()
@@ -320,14 +342,14 @@ def main() -> int:
     eviction.install()
 
     try:
-        for problem in PROBLEMS:
+        for problem in problems:
             if problem.step_number in solved_steps:
                 continue
 
             runtime.next_step_number = problem.step_number
             runtime.next_problem = problem.prompt
 
-            print(f"--- [{config.worker_id}] Problem {problem.step_number} of 5 ---")
+            print(f"--- [{config.worker_id}] Step {problem.step_number}/{steps_total}: {problem.topic} ---")
             result = call_inference(config, runtime, problem.prompt)
             latency_ms = int(result.get("latency_ms") or 0)
             tokens_used = int(result.get("tokens_used") or 0)
@@ -351,6 +373,11 @@ def main() -> int:
                 solved_steps.add(problem.step_number)
                 continue
 
+            next_step_num = problem.step_number + 1
+            next_problem_text = ""
+            if next_step_num <= steps_total:
+                next_problem_text = get_problem(problems, next_step_num).prompt
+
             client.update_session(
                 config.session_id,
                 steps_completed=problem.step_number,
@@ -361,8 +388,8 @@ def main() -> int:
             client.upsert_state(
                 session_id=config.session_id,
                 worker_id=config.worker_id,
-                next_step_number=problem.step_number + 1,
-                next_problem=get_problem(problem.step_number + 1).prompt if problem.step_number < 5 else "",
+                next_step_number=next_step_num,
+                next_problem=next_problem_text,
                 machine_id=config.machine_id,
                 inference_node=runtime.inference_node,
                 status="active",
@@ -377,12 +404,12 @@ def main() -> int:
             )
 
             runtime.steps_completed = problem.step_number
-            runtime.next_step_number = problem.step_number + 1
-            runtime.next_problem = get_problem(runtime.next_step_number).prompt if runtime.next_step_number <= 5 else ""
+            runtime.next_step_number = next_step_num
+            runtime.next_problem = next_problem_text
             solved_steps.add(problem.step_number)
 
             print("Checkpoint saved")
-            if problem.step_number < 5:
+            if problem.step_number < steps_total:
                 print("Sleeping 5 seconds...")
                 time.sleep(5)
 
@@ -392,7 +419,7 @@ def main() -> int:
 
         client.update_session(
             config.session_id,
-            steps_completed=5,
+            steps_completed=steps_total,
             status="completed",
             final_report=report,
             current_machine=config.machine_id,
@@ -401,7 +428,7 @@ def main() -> int:
         client.upsert_state(
             session_id=config.session_id,
             worker_id=config.worker_id,
-            next_step_number=6,
+            next_step_number=steps_total + 1,
             next_problem="",
             machine_id=config.machine_id,
             inference_node=runtime.inference_node,
@@ -413,10 +440,10 @@ def main() -> int:
             event="completed",
             from_machine=config.machine_id,
             to_machine=config.machine_id,
-            step_at_event=5,
+            step_at_event=steps_total,
         )
 
-        print(f"Completed all problems. Report: {report_path}")
+        print(f"Completed all {steps_total} steps. Report: {report_path}")
         heartbeat_stop.set()
         deregister_worker(config)
         eviction.mark_done()
@@ -427,4 +454,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

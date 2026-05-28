@@ -44,7 +44,7 @@ def fetch_inference_status(url: str) -> dict:
         }
 
 
-def left_panel(status: dict) -> Panel:
+def left_panel(status: dict, client: RelayCheckpointClient) -> Panel:
     table = Table.grid(padding=(0, 1))
     table.add_row(f"Inference Node: {status.get('inference_node_id', 'unknown')}")
     table.add_row(f"Active Workers: {len(status.get('active_workers', []))}")
@@ -56,10 +56,13 @@ def left_panel(status: dict) -> Panel:
     worker_table.add_column("Worker")
     worker_table.add_column("Session")
     worker_table.add_column("Progress")
+    sessions_by_id = {s.get("session_id"): s for s in client.list_sessions()}
     for worker in status.get("active_workers", []):
         done = int(worker.get("steps_completed", 0))
-        bar = "#" * done + "-" * max(0, 5 - done)
-        worker_table.add_row(worker.get("worker_id", "?"), worker.get("session_id", "?"), f"{bar} {done}/5")
+        session = sessions_by_id.get(worker.get("session_id", ""))
+        total = int(session.get("steps_total", done) if session else done) or done
+        bar = "#" * done + "-" * max(0, total - done)
+        worker_table.add_row(worker.get("worker_id", "?"), worker.get("session_id", "?"), f"{bar} {done}/{total}")
 
     recent = Table(title="Recent Calls")
     recent.add_column("Time")
@@ -127,7 +130,7 @@ def build_layout(status: dict, client: RelayCheckpointClient) -> Layout:
     layout["body"].split_row(Layout(name="left"), Layout(name="right"))
 
     layout["header"].update(Panel("RELAY - Distributed Agent Compute Network", style="bold white on blue"))
-    layout["left"].update(left_panel(status))
+    layout["left"].update(left_panel(status, client))
     layout["right"].update(right_panel(client))
     layout["footer"].update(Text(f"Last refresh: {datetime.now().strftime('%H:%M:%S')}", style="dim"))
     return layout
