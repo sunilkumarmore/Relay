@@ -132,8 +132,7 @@ def workers_cmd() -> None:
 def reset_cmd(session_id: str) -> None:
     """Delete all records for one session."""
     client, _ = load_config()
-    answer = input("Are you sure? (y/n) ").strip().lower()
-    if answer not in {"y", "yes"}:
+    if not click.confirm(f"Delete all data for session {session_id}?", default=False):
         console.print("Reset cancelled.")
         return
     client.reset_session(session_id)

@@ -154,33 +154,30 @@ class RelayCheckpointClient:
         inference_latency_ms: int,
         tokens_used: int,
     ) -> bool:
-        existing = (
+        # Use the DB unique constraint on (session_id, step_number) to make this
+        # atomic — no separate SELECT needed, so two workers racing on the same
+        # step can't both succeed.
+        result = (
             self.client.table("relay_checkpoints")
-            .select("id")
-            .eq("session_id", session_id)
-            .eq("step_number", step_number)
-            .limit(1)
+            .upsert(
+                {
+                    "session_id": session_id,
+                    "worker_id": worker_id,
+                    "step_number": step_number,
+                    "problem": problem,
+                    "solution": solution,
+                    "reasoning": reasoning,
+                    "machine_id": machine_id,
+                    "inference_node": inference_node,
+                    "inference_latency_ms": inference_latency_ms,
+                    "tokens_used": tokens_used,
+                },
+                on_conflict="session_id,step_number",
+                ignore_duplicates=True,
+            )
             .execute()
-            .data
         )
-        if existing:
-            return False
-
-        self.client.table("relay_checkpoints").insert(
-            {
-                "session_id": session_id,
-                "worker_id": worker_id,
-                "step_number": step_number,
-                "problem": problem,
-                "solution": solution,
-                "reasoning": reasoning,
-                "machine_id": machine_id,
-                "inference_node": inference_node,
-                "inference_latency_ms": inference_latency_ms,
-                "tokens_used": tokens_used,
-            }
-        ).execute()
-        return True
+        return bool(result.data)
 
     def insert_inference_log(
         self,

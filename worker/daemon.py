@@ -136,19 +136,41 @@ def deregister_worker(config: WorkerConfig) -> None:
         pass
 
 
-def call_inference(config: WorkerConfig, runtime: Runtime, prompt: str, max_tokens: int) -> dict[str, Any]:
+def call_inference(
+    config: WorkerConfig,
+    runtime: Runtime,
+    prompt: str,
+    max_tokens: int,
+    *,
+    max_retries: int = 3,
+) -> dict[str, Any]:
     payload = {
         "worker_id": config.worker_id,
         "session_id": config.session_id,
         "prompt": prompt,
         "max_tokens": max_tokens,
     }
-    response = requests.post(f"{config.inference_registry}/inference/complete", json=payload, timeout=240)
-    if response.status_code == 401:
-        register_worker(config)
-        response = requests.post(f"{config.inference_registry}/inference/complete", json=payload, timeout=240)
-    response.raise_for_status()
-    return response.json()
+    url = f"{config.inference_registry}/inference/complete"
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            response = requests.post(url, json=payload, timeout=240)
+            if response.status_code == 401:
+                register_worker(config)
+                response = requests.post(url, json=payload, timeout=240)
+            response.raise_for_status()
+            return response.json()
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            last_exc = exc
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code < 500:
+                raise
+            last_exc = exc
+        if attempt < max_retries:
+            wait = 2 ** attempt
+            print(f"Inference attempt {attempt + 1}/{max_retries + 1} failed, retrying in {wait}s: {last_exc}")
+            time.sleep(wait)
+    raise RuntimeError(f"Inference failed after {max_retries + 1} attempts") from last_exc
 
 
 def render_banner(title: str, lines: list[str]) -> None:
@@ -166,7 +188,7 @@ def build_report(client: RelayCheckpointClient, session_id: str) -> str:
     for row in rows:
         lines.extend(
             [
-                f"Problem {row['step_number']} ({row['worker_id']}):",
+                f"Step {row['step_number']} ({row['worker_id']}):",
                 str(row.get("solution", "")),
                 "",
             ]
@@ -452,6 +474,7 @@ def main() -> int:
         return 0
     finally:
         heartbeat_stop.set()
+        deregister_worker(config)  # no-op if already called above; safe since the endpoint is idempotent
 
 
 if __name__ == "__main__":

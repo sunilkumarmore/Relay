@@ -8,9 +8,10 @@ class OllamaClientError(RuntimeError):
 
 
 class OllamaClient:
-    def __init__(self, host: str, model: str) -> None:
+    def __init__(self, host: str, model: str, timeout: float = 180.0) -> None:
         self.host = host.rstrip("/")
         self.model = model
+        self.timeout = timeout
 
     def health(self) -> bool:
         try:
@@ -30,7 +31,7 @@ class OllamaClient:
             },
         }
         try:
-            response = httpx.post(f"{self.host}/api/generate", json=payload, timeout=180.0)
+            response = httpx.post(f"{self.host}/api/generate", json=payload, timeout=self.timeout)
             response.raise_for_status()
             body = response.json()
             text = str(body.get("response", "")).strip()
