@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import yaml
 
 
 @dataclass(frozen=True)
@@ -10,7 +14,8 @@ class Problem:
     prompt: str
 
 
-PROBLEMS: list[Problem] = [
+# Default built-in problems kept for backwards compatibility / demo use.
+_DEFAULT_PROBLEMS: list[Problem] = [
     Problem(
         step_number=1,
         topic="Number Theory",
@@ -76,9 +81,43 @@ PROBLEMS: list[Problem] = [
     ),
 ]
 
+_DEFAULT_GOAL = "Solve 5 complex math and logic problems"
 
-def get_problem(step_number: int) -> Problem:
-    for problem in PROBLEMS:
-        if problem.step_number == step_number:
-            return problem
+
+def load_problems_from_file(path: str) -> tuple[str, list[Problem]]:
+    """Load task goal and steps from a YAML file.
+
+    Expected format::
+
+        goal: "Describe your overall task"
+        steps:
+          - topic: "Step name"
+            prompt: "Full prompt text sent to the LLM"
+          - topic: "Another step"
+            prompt: "..."
+    """
+    data: dict[str, Any] = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    goal: str = str(data.get("goal", "Custom task"))
+    raw_steps: list[dict[str, str]] = data.get("steps", [])
+    if not raw_steps:
+        raise ValueError(f"Task file '{path}' contains no steps.")
+    problems = [
+        Problem(
+            step_number=i + 1,
+            topic=str(step.get("topic", f"Step {i + 1}")),
+            prompt=str(step["prompt"]),
+        )
+        for i, step in enumerate(raw_steps)
+    ]
+    return goal, problems
+
+
+def get_default_problems() -> tuple[str, list[Problem]]:
+    return _DEFAULT_GOAL, list(_DEFAULT_PROBLEMS)
+
+
+def get_problem(problems: list[Problem], step_number: int) -> Problem:
+    for p in problems:
+        if p.step_number == step_number:
+            return p
     raise ValueError(f"Unknown step: {step_number}")

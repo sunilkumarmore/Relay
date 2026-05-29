@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from collections import deque
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import os
@@ -64,18 +66,15 @@ class WorkerInfo:
     steps_completed: int
 
 
-app = FastAPI(title="Relay Inference Registry")
-
-active_workers: dict[str, WorkerInfo] = {}
-request_log: deque[dict[str, Any]] = deque(maxlen=100)
-total_requests = 0
-
 load_dotenv(os.getenv("ENV_FILE", ".env"))
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434").strip()
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3").strip() or "llama3"
+OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "180"))
 INFERENCE_NODE_ID = os.getenv("MACHINE_ID", socket.gethostname()).strip() or socket.gethostname()
+REGISTRY_PORT = int(os.getenv("REGISTRY_PORT", "8765"))
+MAX_TOKENS_DEFAULT = int(os.getenv("MAX_TOKENS", "1200"))
 
-ollama = OllamaClient(OLLAMA_HOST, OLLAMA_MODEL)
+ollama = OllamaClient(OLLAMA_HOST, OLLAMA_MODEL, timeout=OLLAMA_TIMEOUT)
 
 supabase: RelayCheckpointClient | None = None
 if RelayCheckpointClient is not None:
@@ -85,16 +84,52 @@ if RelayCheckpointClient is not None:
     except Exception:
         supabase = None
 
+active_workers: dict[str, WorkerInfo] = {}
+request_log: deque[dict[str, Any]] = deque(maxlen=100)
+total_requests = 0
+
+# Cache for the Ollama health check — avoids a live HTTP call on every /health request.
+_ollama_health_cache: tuple[bool, datetime] | None = None
+_OLLAMA_HEALTH_TTL = timedelta(seconds=5)
+
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def ollama_healthy() -> bool:
+    global _ollama_health_cache
+    now = now_utc()
+    if _ollama_health_cache is not None:
+        result, ts = _ollama_health_cache
+        if now - ts < _OLLAMA_HEALTH_TTL:
+            return result
+    result = ollama.health()
+    _ollama_health_cache = (result, now)
+    return result
+
+
 def prune_stale_workers() -> None:
     cutoff = now_utc() - timedelta(seconds=60)
-    stale = [worker_id for worker_id, info in active_workers.items() if info.last_heartbeat < cutoff]
-    for worker_id in stale:
-        del active_workers[worker_id]
+    stale = [wid for wid, info in active_workers.items() if info.last_heartbeat < cutoff]
+    for wid in stale:
+        del active_workers[wid]
+
+
+async def _prune_loop() -> None:
+    while True:
+        await asyncio.sleep(30)
+        prune_stale_workers()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):  # noqa: ANN001
+    task = asyncio.create_task(_prune_loop())
+    yield
+    task.cancel()
+
+
+app = FastAPI(title="Relay Inference Registry", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -102,27 +137,28 @@ def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "model": OLLAMA_MODEL,
-        "ollama_connected": ollama.health(),
+        "ollama_connected": ollama_healthy(),
     }
 
 
 @app.post("/worker/register")
 def worker_register(req: RegisterRequest) -> dict[str, Any]:
     ts = now_utc()
+    existing = active_workers.get(req.worker_id)
     active_workers[req.worker_id] = WorkerInfo(
         worker_id=req.worker_id,
         session_id=req.session_id,
         machine_id=req.machine_id,
-        registered_at=ts,
+        registered_at=existing.registered_at if existing else ts,
         last_heartbeat=ts,
-        steps_completed=0,
+        # Preserve progress so the dashboard doesn't flash back to 0 on re-register.
+        steps_completed=existing.steps_completed if existing else 0,
     )
     return {"accepted": True, "inference_node_id": INFERENCE_NODE_ID}
 
 
 @app.post("/worker/heartbeat")
 def worker_heartbeat(req: HeartbeatRequest) -> dict[str, Any]:
-    prune_stale_workers()
     info = active_workers.get(req.worker_id)
     if info:
         info.last_heartbeat = now_utc()
@@ -140,7 +176,6 @@ def worker_deregister(req: DeregisterRequest) -> dict[str, Any]:
 def inference_complete(req: InferenceRequest) -> dict[str, Any]:
     global total_requests
 
-    prune_stale_workers()
     if req.worker_id not in active_workers:
         raise HTTPException(status_code=401, detail="worker_not_registered")
 
@@ -190,7 +225,6 @@ def inference_complete(req: InferenceRequest) -> dict[str, Any]:
 
 @app.get("/inference/status")
 def inference_status() -> dict[str, Any]:
-    prune_stale_workers()
     one_minute_ago = now_utc() - timedelta(minutes=1)
     recent = [row for row in request_log if datetime.fromisoformat(row["ts"]) >= one_minute_ago]
     avg_latency = int(sum(row["latency_ms"] for row in recent) / len(recent)) if recent else 0
@@ -215,9 +249,8 @@ def inference_status() -> dict[str, Any]:
 
 
 def main() -> None:
-    uvicorn.run(app, host="0.0.0.0", port=8765)
+    uvicorn.run(app, host="0.0.0.0", port=REGISTRY_PORT)
 
 
 if __name__ == "__main__":
     main()
-

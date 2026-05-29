@@ -6,7 +6,7 @@ CREATE TABLE relay_sessions (
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW(),
   task_goal TEXT NOT NULL,
-  steps_total INTEGER NOT NULL DEFAULT 5,
+  steps_total INTEGER NOT NULL DEFAULT 0,
   steps_completed INTEGER DEFAULT 0,
   status TEXT DEFAULT 'in_progress',
   final_report TEXT,

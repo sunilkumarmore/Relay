@@ -1,0 +1,19 @@
+goal: "Analyze and summarize a software project"
+
+steps:
+  - topic: "Tech stack overview"
+    prompt: >
+      List the most common programming languages, frameworks, and databases
+      used in modern SaaS web applications in 2024. For each, give one sentence
+      on its primary use case. Be concise.
+
+  - topic: "Architecture patterns"
+    prompt: >
+      Describe the key differences between monolithic, microservices, and
+      serverless architectures. Include pros and cons of each. Keep it under
+      300 words.
+
+  - topic: "Deployment checklist"
+    prompt: >
+      Write a 10-item production deployment checklist for a Python web
+      application. Each item should be actionable and specific.
