@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "relay"
+version = "0.1.0"
+description = "Two-tier distributed AI agent system with resumable workers"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "supabase==2.3.4",
+    "python-dotenv==1.0.0",
+    "rich==13.7.0",
+    "httpx==0.25.2",
+    "fastapi==0.110.0",
+    "uvicorn==0.29.0",
+    "click==8.1.7",
+    "requests==2.31.0",
+    "pyyaml==6.0.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.1.1", "ruff==0.3.5"]
+
+[project.scripts]
+relay-worker = "relay.worker.daemon:run"
+relay-inference = "relay.inference.registry:run"
+relay-controller = "relay.controller.cli:cli"
+relay-dashboard = "relay.dashboard.tui:run"
+
+[tool.setuptools.packages.find]
+include = ["relay*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4"]
+ignore = ["B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]

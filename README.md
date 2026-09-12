@@ -11,16 +11,16 @@ Relay is a two-tier distributed AI agent system.
 
 Relay demonstrates an architecture for a peer-to-peer AI compute marketplace:
 
-- Inference tier: shared LLM service (`inference/registry.py` + Ollama)
-- Worker tier: distributed agent workers (`worker/daemon.py`)
+- Inference tier: shared LLM service (`relay/inference/registry.py` + Ollama)
+- Worker tier: distributed agent workers (`relay/worker/daemon.py`)
 - External state tier: Supabase (`relay_*` tables)
-- Observability tier: terminal dashboard (`dashboard/dashboard.py`)
+- Observability tier: terminal dashboard (`relay/dashboard/tui.py`)
 
 ## Prerequisites
 
 Both machines need:
 - Python 3.11+
-- `pip install -r requirements.txt`
+- `pip install -e .`
 - Supabase account and project (free tier is fine)
 - Both machines reachable on the same network
 
@@ -37,7 +37,7 @@ Machine 1 (inference node) also needs:
 
 ## Machine 1 Setup (Inference Node)
 
-1. Clone repo and `pip install -r requirements.txt`
+1. Clone repo and `pip install -e .`
 2. Create `.env` from `.env.example`:
 
 ```env
@@ -64,7 +64,7 @@ ollama serve
 4. Start the inference registry:
 
 ```bash
-python inference/registry.py
+python -m relay.inference
 ```
 
 5. Verify it's running:
@@ -88,7 +88,7 @@ netsh advfirewall firewall add rule name="Relay Ollama"   dir=in action=allow pr
 
 ## Machine 2 Setup (Worker Node)
 
-1. Clone repo and `pip install -r requirements.txt`
+1. Clone repo and `pip install -e .`
 2. Find Machine 1's IP address:
 
 ```bash
@@ -127,21 +127,21 @@ Open 4 terminals on Machine 2:
 
 ```bash
 # Terminal 1 — worker-alpha
-ENV_FILE=.env.alpha python worker/daemon.py
+ENV_FILE=.env.alpha python -m relay.worker
 
 # Terminal 2 — worker-beta
-ENV_FILE=.env.beta python worker/daemon.py
+ENV_FILE=.env.beta python -m relay.worker
 
 # Terminal 3 — live dashboard
-python dashboard/dashboard.py
+python -m relay.dashboard
 
 # Terminal 4 — controller
-python controller/controller.py workers
+python -m relay.controller workers
 ```
 
 **Windows:**
 ```bat
-set ENV_FILE=.env.alpha && python worker/daemon.py
+set ENV_FILE=.env.alpha && python -m relay.worker
 ```
 
 Kill `worker-alpha` during a sleep window (`Ctrl+C`), then restart it with the same `.env.alpha`.  
@@ -169,7 +169,7 @@ steps:
 Point a worker at it with `TASK_FILE`:
 
 ```bash
-TASK_FILE=tasks/my-task.yaml ENV_FILE=.env.alpha python worker/daemon.py
+TASK_FILE=tasks/my-task.yaml ENV_FILE=.env.alpha python -m relay.worker
 ```
 
 Or add it to your `.env.alpha`:
@@ -193,11 +193,11 @@ The worker will pick up from the last saved checkpoint automatically.
 ## Controller Commands
 
 ```bash
-python controller/controller.py status                    # all sessions
-python controller/controller.py inference-status          # inference node metrics
-python controller/controller.py workers                   # worker state + migration log
-python controller/controller.py reset --session <id>      # wipe a session
-python controller/controller.py report --session <id>     # print final report
+python -m relay.controller status                    # all sessions
+python -m relay.controller inference-status          # inference node metrics
+python -m relay.controller workers                   # worker state + migration log
+python -m relay.controller reset --session <id>      # wipe a session
+python -m relay.controller report --session <id>     # print final report
 ```
 
 ## What the Demo Proves
@@ -208,6 +208,31 @@ python controller/controller.py report --session <id>     # print final report
 4. Dashboard shows real-time request and migration telemetry.
 5. Machine + inference node audit trail is persisted per step.
 
+## Development
+
+Install with the dev extras and run the checks:
+
+```bash
+pip install -e ".[dev]"
+ruff check .
+pytest
+```
+
+The test suite needs no Supabase project, no Ollama, and no network. Two
+substitutions make that possible:
+
+- `RELAY_STORE=memory|file` swaps Supabase for an in-process or JSON-file store
+  (`relay/store.py`). `file` is shared across processes, which is what lets a
+  worker be killed in one process and inspected from another.
+- `RELAY_BACKEND=fake` swaps Ollama for a deterministic backend
+  (`relay/inference/backends.py`) with configurable latency and failure
+  injection.
+
+The eviction tests are the ones worth reading first: they run the worker as a
+real subprocess, send it `SIGTERM` (graceful) or `SIGKILL` (preemption with no
+warning), and assert that a resumed run finishes the task with no duplicated or
+skipped steps — see `tests/test_hard_eviction.py`.
+
 ## Troubleshooting
 
 **Machine 2 cannot reach Machine 1:**
@@ -215,6 +240,9 @@ python controller/controller.py report --session <id>     # print final report
 curl http://<machine1-ip>:8765/health
 ```
 Check firewall rules and that both machines are on the same network.
+
+**Import errors after upgrading:** the package is now installable — run
+`pip install -e .` from the repo root.
 
 **Worker registers but inference fails:**
 ```bash
@@ -234,23 +262,27 @@ Make sure Ollama is running with `OLLAMA_HOST=0.0.0.0`.
 
 ```
 relay/
-├── inference/
-│   ├── registry.py
-│   └── ollama_client.py
-├── worker/
-│   ├── daemon.py
-│   ├── problems.py
-│   ├── checkpoint_client.py
-│   └── eviction_handler.py
-├── dashboard/
-│   └── dashboard.py
-├── controller/
-│   └── controller.py
-├── tasks/
-│   └── example.yaml
-├── setup/
-│   └── supabase_setup.sql
+├── relay/
+│   ├── config.py           # env loading
+│   ├── store.py            # Store protocol + Supabase / Memory / File
+│   ├── inference/
+│   │   ├── backends.py     # InferenceBackend protocol + Ollama / Fake
+│   │   └── registry.py     # the HTTP front door
+│   ├── worker/
+│   │   ├── daemon.py       # the agent loop
+│   │   ├── tasks.py        # task YAML loading
+│   │   └── eviction.py     # signal handling
+│   ├── controller/cli.py
+│   └── dashboard/tui.py
+├── tests/                  # runs with no network
+├── tasks/example.yaml
+├── setup/supabase_setup.sql
+├── docs/MARKETPLACE_PLAN.md
 ├── output/
 ├── .env.example
-└── requirements.txt
+└── pyproject.toml
 ```
+
+The old top-level `worker/`, `inference/`, `controller/` and `dashboard/`
+directories still exist as thin shims that forward to the package and emit a
+`DeprecationWarning`. They will be removed in the next release.
