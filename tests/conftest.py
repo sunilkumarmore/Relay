@@ -224,10 +224,11 @@ def market(tmp_path):
         max_concurrency: int = 8,
         region: str = "lab",
         context_window: int = 8192,
+        backend=None,
     ) -> RegistryServer:
         port = free_port()
         endpoint = f"http://127.0.0.1:{port}"
-        backend = FakeBackend(latency_ms=latency_ms, available_models=[model])
+        backend = backend or FakeBackend(latency_ms=latency_ms, available_models=[model])
         provider = Provider(
             ProviderConfig(
                 endpoint_url=endpoint,

@@ -6,6 +6,8 @@ from rich.console import Console
 from rich.table import Table
 
 from relay import config
+from relay.identity import identity_from_env
+from relay.ledger import Ledger, LedgerError, sweep_expired_holds
 from relay.store import RelayStoreError, Store, store_from_env
 
 console = Console()
@@ -153,6 +155,148 @@ def report_cmd(session_id: str) -> None:
     checkpoints = store.get_checkpoints(session_id)
     for row in checkpoints:
         console.print(f"Step {row.get('step_number')}:\n{row.get('solution')}\n")
+
+
+@cli.group("wallet")
+def wallet() -> None:
+    """Credits: what you have, what is committed, and where it went."""
+
+
+@wallet.command("balance")
+def wallet_balance_cmd() -> None:
+    """Show available and held credits for this node."""
+    store, _ = load_config()
+    ledger = Ledger(store)
+    node_id = identity_from_env().node_id
+
+    table = Table(title=f"Wallet {node_id[:16]}")
+    table.add_column("Available")
+    table.add_column("Held")
+    table.add_column("Total")
+    held = ledger.held_balance(node_id)
+    balance = ledger.balance(node_id)
+    table.add_row(f"{balance:.6f}", f"{held:.6f}", f"{balance + held:.6f}")
+    console.print(table)
+
+
+@wallet.command("deposit")
+@click.option("--amount", type=float, required=True, help="Credits to add")
+@click.option("--dev", is_flag=True, help="Use the development faucet")
+def wallet_deposit_cmd(amount: float, dev: bool) -> None:
+    """Add credits. In v1 the only source is the development faucet."""
+    if not dev:
+        console.print(
+            "Relay has no payment rail yet, so --dev is the only way to add credits.\n"
+            "A real deposit would post the same ledger entry from a payment webhook."
+        )
+        raise SystemExit(1)
+    if config.get("RELAY_DEV_MODE") != "1":
+        console.print("Refusing: set RELAY_DEV_MODE=1 to use the faucet.")
+        raise SystemExit(1)
+    if amount <= 0:
+        console.print("Deposit must be positive.")
+        raise SystemExit(1)
+
+    store, _ = load_config()
+    node_id = identity_from_env().node_id
+    ledger = Ledger(store)
+    ledger.deposit(node_id, amount)
+    console.print(f"Deposited {amount} credits. Balance: {ledger.balance(node_id):.6f}")
+
+
+@wallet.command("history")
+@click.option("--limit", type=int, default=20, show_default=True)
+def wallet_history_cmd(limit: int) -> None:
+    """Show recent ledger entries for this node."""
+    store, _ = load_config()
+    node_id = identity_from_env().node_id
+
+    table = Table(title="Ledger")
+    for column in ("When", "Kind", "Account", "Debit", "Credit", "Job"):
+        table.add_column(column)
+    for row in Ledger(store).history(node_id, limit):
+        account = str(row.get("account", ""))
+        table.add_row(
+            str(row.get("created_at", ""))[11:19],
+            str(row.get("kind", "")),
+            account.split(":", 1)[-1],
+            f"{float(row.get('debit') or 0):.6f}",
+            f"{float(row.get('credit') or 0):.6f}",
+            str(row.get("ref_job_id", ""))[:12],
+        )
+    console.print(table)
+
+
+@wallet.command("sweep")
+@click.option("--ttl", type=int, default=3600, show_default=True, help="Seconds of silence")
+def wallet_sweep_cmd(ttl: int) -> None:
+    """Release holds for jobs that were abandoned rather than finished."""
+    store, _ = load_config()
+    released = sweep_expired_holds(store, Ledger(store), ttl_seconds=ttl)
+    if not released:
+        console.print("Nothing to release.")
+        return
+    for node_id, job_id, amount in released:
+        console.print(f"Released {amount:.6f} held by {node_id[:12]} for job {job_id}")
+
+
+@wallet.command("verify")
+def wallet_verify_cmd() -> None:
+    """Check that the ledger balances. Every account together must be zero."""
+    store, _ = load_config()
+    ledger = Ledger(store)
+    try:
+        ledger.check_invariant()
+    except LedgerError as exc:
+        console.print(f"LEDGER IS BROKEN: {exc}")
+        raise SystemExit(1) from exc
+    console.print(f"Ledger balances. Total across all accounts: {ledger.total():.6f}")
+
+
+@cli.command("receipts")
+@click.option("--session", "session_id", default=None, help="Only this job")
+def receipts_cmd(session_id: str | None) -> None:
+    """Show receipts and whether they were acknowledged."""
+    store, _ = load_config()
+    rows = store.list_receipts(job_id=session_id)
+
+    table = Table(title="Receipts")
+    for column in ("Job", "Step", "Provider", "Tokens in/out", "Credits", "Status"):
+        table.add_column(column)
+    for row in rows:
+        table.add_row(
+            str(row.get("job_id", ""))[:12],
+            str(row.get("step_number", "")),
+            str(row.get("provider_node_id", ""))[:12],
+            f"{row.get('tokens_in', 0)}/{row.get('tokens_out', 0)}",
+            f"{float(row.get('amount_credits') or 0):.6f}",
+            str(row.get("status", "")),
+        )
+    console.print(table)
+
+    total = sum(float(r.get("amount_credits") or 0) for r in rows if r.get("status") == "acknowledged")
+    console.print(f"Acknowledged total: {total:.6f} credits")
+
+
+@cli.command("earnings")
+def earnings_cmd() -> None:
+    """Show what this node has earned as a provider."""
+    store, _ = load_config()
+    node_id = identity_from_env().node_id
+    rows = store.list_receipts(provider_node_id=node_id)
+
+    buckets: dict[str, float] = {}
+    for row in rows:
+        status = str(row.get("status", "unacknowledged"))
+        buckets[status] = buckets.get(status, 0.0) + float(row.get("amount_credits") or 0)
+
+    table = Table(title=f"Earnings {node_id[:16]}")
+    table.add_column("Status")
+    table.add_column("Credits")
+    for status in sorted(buckets):
+        table.add_row(status, f"{buckets[status]:.6f}")
+    console.print(table)
+    console.print(f"Settled balance: {Ledger(store).balance(node_id):.6f}")
 
 
 def run() -> None:

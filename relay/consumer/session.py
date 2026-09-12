@@ -20,6 +20,7 @@ from typing import Any
 
 import requests
 
+from relay import tokens as tokenizer
 from relay.auth import RelayAuth
 from relay.consumer.market import (
     DEFAULT_FAILOVER_COOLDOWN_SECONDS,
@@ -30,7 +31,9 @@ from relay.consumer.market import (
     Selector,
 )
 from relay.identity import Identity
+from relay.ledger import Ledger
 from relay.provider.offers import Offer
+from relay.receipts import Receipt, request_fingerprint, verify_receipt
 from relay.store import Store
 
 REGISTER_TIMEOUT_SECONDS = 10
@@ -74,6 +77,7 @@ class MarketSession:
         max_retries: int = 3,
         on_switch: Callable[[str, str, str], None] | None = None,
         prefer_provider: str | None = None,
+        ledger: Ledger | None = None,
     ) -> None:
         self.identity = identity
         self.store = store
@@ -89,8 +93,11 @@ class MarketSession:
 
         self.directory = Directory(store)
         self.bench = Bench(cooldown_seconds)
+        self.ledger = ledger
         self.binding: Binding | None = None
         self.switches = 0
+        self.spent = 0.0
+        self.disputed: list[Receipt] = []
 
     @property
     def auth(self) -> RelayAuth:
@@ -204,13 +211,16 @@ class MarketSession:
         except Exception:
             pass
 
-    def _attempt(self, binding: Binding, prompt: str, max_tokens: int) -> dict[str, Any]:
+    def _attempt(
+        self, binding: Binding, prompt: str, max_tokens: int, step_number: int = 0
+    ) -> dict[str, Any]:
         """One provider, with retries. Raises ProviderUnavailable to fail over."""
         payload: dict[str, Any] = {
             "worker_id": self.worker_id,
             "session_id": self.session_id,
             "prompt": prompt,
             "max_tokens": max_tokens,
+            "step_number": step_number,
         }
         if binding.offer is not None:
             payload["model"] = binding.offer.model
@@ -254,7 +264,7 @@ class MarketSession:
 
         raise ProviderUnavailable(f"failed after {self.max_retries + 1} attempts: {last_exc}")
 
-    def complete(self, prompt: str, max_tokens: int) -> dict[str, Any]:
+    def complete(self, prompt: str, max_tokens: int, step_number: int = 0) -> dict[str, Any]:
         """Run one step, changing provider as many times as it takes."""
         binding = self.ensure_bound()
         # One shot at every provider that qualifies, plus the one we start on.
@@ -263,7 +273,7 @@ class MarketSession:
         for _ in range(budget):
             started = time.perf_counter()
             try:
-                result = self._attempt(binding, prompt, max_tokens)
+                result = self._attempt(binding, prompt, max_tokens, step_number)
             except ProviderUnavailable as exc:
                 latency_ms = int((time.perf_counter() - started) * 1000)
                 self._observe(binding.provider_node_id, ok=False, latency_ms=latency_ms, error=str(exc))
@@ -281,9 +291,100 @@ class MarketSession:
                 ok=True,
                 latency_ms=int(result.get("latency_ms") or 0),
             )
+            self._handle_receipt(binding, result, prompt, max_tokens, step_number)
             return result
 
         raise RuntimeError("Exhausted every provider that met this job's requirements")
+
+    # -- paying -----------------------------------------------------------
+    def _handle_receipt(
+        self,
+        binding: Binding,
+        result: dict[str, Any],
+        prompt: str,
+        max_tokens: int,
+        step_number: int,
+    ) -> None:
+        """Check the bill before paying it, then pay it.
+
+        A receipt that does not survive checking is recorded as disputed rather
+        than quietly dropped: the work was still done, and Phase 5 decides who
+        was right. What we do not do is countersign it.
+        """
+        if binding.offer is None or "receipt" not in result:
+            # A pinned endpoint with no offer behind it bills nothing.
+            return
+
+        try:
+            receipt = Receipt.from_row(result["receipt"])
+        except Exception as exc:
+            print(f"Provider returned an unreadable receipt: {exc}")
+            return
+
+        response_text = str(result.get("response", "")).strip()
+        problems = verify_receipt(
+            receipt,
+            offer=binding.offer,
+            consumer_node_id=self.identity.node_id,
+            request_hash=request_fingerprint(prompt, max_tokens, binding.offer.model),
+            response_text=response_text,
+            job_id=self.session_id,
+            step_number=step_number,
+        )
+        problems += self._token_objections(receipt, prompt, response_text, binding.offer.model)
+
+        if problems:
+            reason = "; ".join(problems)
+            print(f"Refusing to acknowledge receipt {receipt.receipt_id[:8]}: {reason}")
+            disputed = receipt.disputed(reason)
+            self.disputed.append(disputed)
+            self._save_receipt(disputed)
+            return
+
+        acknowledged = receipt.acknowledged_by(self.identity)
+        self._save_receipt(acknowledged)
+        self.spent = round(self.spent + acknowledged.amount_credits, 6)
+
+        if self.ledger is not None:
+            try:
+                self.ledger.settle(
+                    self.identity.node_id,
+                    acknowledged.provider_node_id,
+                    acknowledged.amount_credits,
+                    receipt_id=acknowledged.receipt_id,
+                    job_id=self.session_id,
+                )
+            except Exception as exc:
+                print(f"Could not settle receipt {acknowledged.receipt_id[:8]}: {exc}")
+
+    def _token_objections(
+        self, receipt: Receipt, prompt: str, response_text: str, model: str
+    ) -> list[str]:
+        """Is the provider's token claim credible against our own count?
+
+        Only over-claiming is an objection. Under-claiming means the provider
+        charged us less than it could have, which is not a problem we have.
+        """
+        objections = []
+        for label, text, claimed in (
+            ("input", prompt, receipt.tokens_in),
+            ("output", response_text, receipt.tokens_out),
+        ):
+            measured = tokenizer.estimate(text, model)
+            if not measured.permits(claimed):
+                objections.append(
+                    f"{label} tokens claimed {claimed}, we measured about {measured.tokens} "
+                    f"(tolerance {int(measured.tolerance * 100)}%)"
+                )
+        return objections
+
+    def _save_receipt(self, receipt: Receipt) -> None:
+        if self.store is None:
+            return
+        try:
+            self.store.upsert_receipt(receipt.to_row())
+        except Exception:
+            pass
 
     # -- telemetry --------------------------------------------------------
     def _observe(

@@ -25,6 +25,7 @@ from relay import config
 from relay.consumer.market import NoProviderAvailable, Requirements, Selector
 from relay.consumer.session import MarketSession
 from relay.identity import Identity, identity_from_env
+from relay.ledger import InsufficientFunds, Ledger
 from relay.store import RelayStoreError, Store, store_from_env
 from relay.worker.eviction import EvictionManager, EvictionState
 from relay.worker.tasks import Problem, Task, default_task, get_problem, load_task
@@ -162,6 +163,8 @@ def run_worker(
     steps_total = len(problems)
     out_dir = output_dir()
     out_dir.mkdir(parents=True, exist_ok=True)
+    requirements = Requirements.from_dict(task.requirements)
+    ledger = Ledger(store)
 
     if cfg.inference_registry:
         # Pinned to one endpoint: check it is there before doing anything else,
@@ -212,7 +215,7 @@ def run_worker(
         worker_id=cfg.worker_id,
         session_id=cfg.session_id,
         machine_id=cfg.machine_id,
-        requirements=Requirements.from_dict(task.requirements),
+        requirements=requirements,
         selector=Selector(policy=cfg.policy, pinned_node_id=cfg.pinned_node_id),
         pinned_url=cfg.inference_registry or None,
         cooldown_seconds=cfg.failover_cooldown_seconds,
@@ -220,7 +223,20 @@ def run_worker(
         on_switch=record_switch,
         # A resumed worker goes back to the provider it was using, if it still qualifies.
         prefer_provider=(existing_state or {}).get("provider_node_id"),
+        ledger=ledger,
     )
+
+    if requirements.budget_credits:
+        # Commit the budget before starting. A job that cannot pay should not
+        # consume a provider's capacity discovering that.
+        try:
+            ledger.hold(cfg.identity.node_id, requirements.budget_credits, cfg.session_id)
+        except InsufficientFunds as exc:
+            print(
+                f"ERROR: {exc}\n"
+                " Top up with: python -m relay.controller wallet deposit --amount N --dev"
+            )
+            return 1
 
     try:
         binding = session.bind()
@@ -359,7 +375,7 @@ def run_worker(
             runtime.next_problem = problem.prompt
 
             print(f"--- [{cfg.worker_id}] Step {problem.step_number}/{steps_total}: {problem.topic} ---")
-            result = session.complete(problem.prompt, max_tokens)
+            result = session.complete(problem.prompt, max_tokens, problem.step_number)
 
             # The provider may have changed while this step ran.
             if session.binding is not None:
@@ -457,6 +473,12 @@ def run_worker(
             to_machine=cfg.machine_id,
             step_at_event=steps_total,
         )
+
+        if requirements.budget_credits:
+            returned = ledger.release_remaining(cfg.identity.node_id, cfg.session_id)
+            print(f"Spent {session.spent} credits; released {round(returned, 6)} back to balance")
+        if session.disputed:
+            print(f"WARNING: {len(session.disputed)} receipt(s) were not acknowledged")
 
         print(f"Completed all {steps_total} steps. Report: {report_path}")
         heartbeat_stop.set()

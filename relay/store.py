@@ -214,6 +214,41 @@ class Store(Protocol):
         self, provider_node_id: str | None = None, limit: int = 200
     ) -> list[dict[str, Any]]: ...
 
+    # -- receipts and ledger ----------------------------------------------
+    def upsert_receipt(self, receipt: dict[str, Any]) -> None: ...
+
+    def get_receipt(self, receipt_id: str) -> dict[str, Any] | None: ...
+
+    def list_receipts(
+        self,
+        job_id: str | None = None,
+        provider_node_id: str | None = None,
+        consumer_node_id: str | None = None,
+        status: str | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]: ...
+
+    def upsert_account(self, node_id: str, balance_cached: float, stake: float = 0.0) -> None: ...
+
+    def get_account(self, node_id: str) -> dict[str, Any] | None: ...
+
+    def list_accounts(self) -> list[dict[str, Any]]: ...
+
+    def insert_ledger_tx(self, entries: list[dict[str, Any]], idempotency_key: str) -> bool:
+        """Append one transaction atomically. Returns False when this exact
+        transaction was already posted — which is what stops a retried
+        settlement paying twice."""
+        ...
+
+    def list_ledger_entries(
+        self,
+        account: str | None = None,
+        tx_id: str | None = None,
+        kind: str | None = None,
+        ref_receipt_id: str | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]: ...
+
     def reset_session(self, session_id: str) -> None: ...
 
 
@@ -585,6 +620,98 @@ class SupabaseStore:
         data = query.order("observed_at", desc=True).limit(limit).execute().data
         return list(data or [])
 
+    def upsert_receipt(self, receipt: dict[str, Any]) -> None:
+        self.client.table("relay_receipts").upsert(receipt, on_conflict="receipt_id").execute()
+
+    def get_receipt(self, receipt_id: str) -> dict[str, Any] | None:
+        rows = (
+            self.client.table("relay_receipts")
+            .select("*")
+            .eq("receipt_id", receipt_id)
+            .limit(1)
+            .execute()
+            .data
+        )
+        return rows[0] if rows else None
+
+    def list_receipts(
+        self,
+        job_id: str | None = None,
+        provider_node_id: str | None = None,
+        consumer_node_id: str | None = None,
+        status: str | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        query = self.client.table("relay_receipts").select("*")
+        for column, value in (
+            ("job_id", job_id),
+            ("provider_node_id", provider_node_id),
+            ("consumer_node_id", consumer_node_id),
+            ("status", status),
+        ):
+            if value is not None:
+                query = query.eq(column, value)
+        return list(query.limit(limit).execute().data or [])
+
+    def upsert_account(self, node_id: str, balance_cached: float, stake: float = 0.0) -> None:
+        self.client.table("relay_accounts").upsert(
+            {"node_id": node_id, "balance_cached": balance_cached, "stake": stake},
+            on_conflict="node_id",
+        ).execute()
+
+    def get_account(self, node_id: str) -> dict[str, Any] | None:
+        rows = (
+            self.client.table("relay_accounts")
+            .select("*")
+            .eq("node_id", node_id)
+            .limit(1)
+            .execute()
+            .data
+        )
+        return rows[0] if rows else None
+
+    def list_accounts(self) -> list[dict[str, Any]]:
+        return list(self.client.table("relay_accounts").select("*").execute().data or [])
+
+    def insert_ledger_tx(self, entries: list[dict[str, Any]], idempotency_key: str) -> bool:
+        if not entries:
+            return False
+        tx_id = entries[0]["tx_id"]
+        # The unique index on idempotency_key is the guard: if this transaction
+        # was already posted, the claim fails and no entries are written.
+        claimed = (
+            self.client.table("relay_ledger_tx")
+            .upsert(
+                {"tx_id": tx_id, "idempotency_key": idempotency_key, "kind": entries[0]["kind"]},
+                on_conflict="idempotency_key",
+                ignore_duplicates=True,
+            )
+            .execute()
+        )
+        if not claimed.data:
+            return False
+        self.client.table("relay_ledger_entries").insert(entries).execute()
+        return True
+
+    def list_ledger_entries(
+        self,
+        account: str | None = None,
+        tx_id: str | None = None,
+        kind: str | None = None,
+        ref_receipt_id: str | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        query = self.client.table("relay_ledger_entries").select("*")
+        for column, value in (
+            ("account", account),
+            ("tx_id", tx_id),
+            ("kind", kind),
+            ("ref_receipt_id", ref_receipt_id),
+        ):
+            if value is not None:
+                query = query.eq(column, value)
+        return list(query.limit(limit).execute().data or [])
+
     def reset_session(self, session_id: str) -> None:
         for table in (
             "relay_worker_state",
@@ -609,6 +736,10 @@ TABLES = (
     "offers",
     "provider_events",
     "provider_health",
+    "receipts",
+    "accounts",
+    "ledger_tx",
+    "ledger_entries",
 )
 
 
@@ -1020,10 +1151,115 @@ class MemoryStore:
         rows.sort(key=lambda r: str(r.get("observed_at", "")), reverse=True)
         return rows[:limit]
 
+    def upsert_receipt(self, receipt: dict[str, Any]) -> None:
+        with self._txn():
+            for row in self.tables["receipts"]:
+                if row["receipt_id"] == receipt["receipt_id"]:
+                    row.update(receipt)
+                    return
+            self.tables["receipts"].append(dict(receipt))
+
+    def get_receipt(self, receipt_id: str) -> dict[str, Any] | None:
+        tables = self._view()
+        for row in tables["receipts"]:
+            if row["receipt_id"] == receipt_id:
+                return dict(row)
+        return None
+
+    def list_receipts(
+        self,
+        job_id: str | None = None,
+        provider_node_id: str | None = None,
+        consumer_node_id: str | None = None,
+        status: str | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        tables = self._view()
+        wanted = {
+            "job_id": job_id,
+            "provider_node_id": provider_node_id,
+            "consumer_node_id": consumer_node_id,
+            "status": status,
+        }
+        rows = [
+            dict(r)
+            for r in tables["receipts"]
+            if all(v is None or r.get(k) == v for k, v in wanted.items())
+        ]
+        rows.sort(key=lambda r: (str(r.get("job_id", "")), int(r.get("step_number") or 0)))
+        return rows[:limit]
+
+    def upsert_account(self, node_id: str, balance_cached: float, stake: float = 0.0) -> None:
+        with self._txn():
+            for row in self.tables["accounts"]:
+                if row["node_id"] == node_id:
+                    row["balance_cached"] = balance_cached
+                    row["stake"] = stake
+                    return
+            self.tables["accounts"].append(
+                {"node_id": node_id, "balance_cached": balance_cached, "stake": stake}
+            )
+
+    def get_account(self, node_id: str) -> dict[str, Any] | None:
+        tables = self._view()
+        for row in tables["accounts"]:
+            if row["node_id"] == node_id:
+                return dict(row)
+        return None
+
+    def list_accounts(self) -> list[dict[str, Any]]:
+        tables = self._view()
+        return [dict(r) for r in tables["accounts"]]
+
+    def insert_ledger_tx(self, entries: list[dict[str, Any]], idempotency_key: str) -> bool:
+        if not entries:
+            return False
+        with self._txn():
+            for row in self.tables["ledger_tx"]:
+                if row["idempotency_key"] == idempotency_key:
+                    return False
+            self.tables["ledger_tx"].append(
+                {
+                    "tx_id": entries[0]["tx_id"],
+                    "idempotency_key": idempotency_key,
+                    "kind": entries[0]["kind"],
+                    "created_at": now_iso(),
+                }
+            )
+            for entry in entries:
+                self.tables["ledger_entries"].append({**entry, "created_at": now_iso()})
+            return True
+
+    def list_ledger_entries(
+        self,
+        account: str | None = None,
+        tx_id: str | None = None,
+        kind: str | None = None,
+        ref_receipt_id: str | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        tables = self._view()
+        wanted = {
+            "account": account,
+            "tx_id": tx_id,
+            "kind": kind,
+            "ref_receipt_id": ref_receipt_id,
+        }
+        rows = [
+            dict(r)
+            for r in tables["ledger_entries"]
+            if all(v is None or r.get(k) == v for k, v in wanted.items())
+        ]
+        return rows[:limit]
+
     def reset_session(self, session_id: str) -> None:
         with self._txn():
             for name in self.tables:
-                self.tables[name] = [r for r in self.tables[name] if r.get("session_id") != session_id]
+                self.tables[name] = [
+                    r
+                    for r in self.tables[name]
+                    if r.get("session_id") != session_id and r.get("job_id") != session_id
+                ]
 
 
 class FileStore(MemoryStore):

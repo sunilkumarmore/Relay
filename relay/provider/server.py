@@ -44,6 +44,7 @@ from relay.provider.config import (
     load_provider_config,
 )
 from relay.provider.offers import Offer, build_offer
+from relay.receipts import build_receipt, request_fingerprint
 from relay.store import Store, store_from_env
 
 STALE_AFTER = timedelta(seconds=60)
@@ -76,6 +77,9 @@ class InferenceRequest(BaseModel):
     prompt: str
     max_tokens: int = 1200
     model: str | None = None
+    # Which step of the job this is. Receipts are per step, so that a consumer
+    # can tie what it was charged to what it got.
+    step_number: int = 0
 
 
 @dataclass
@@ -379,7 +383,7 @@ class Provider:
                 pass
 
         offer = self._offers.get(offering.model)
-        return {
+        payload: dict[str, Any] = {
             "response": text,
             "tokens_used": tokens_used,
             "tokens_in": tokens_in,
@@ -390,6 +394,32 @@ class Provider:
             "provider_node_id": self.identity.node_id,
             "offer_id": offer.offer_id if offer else "",
         }
+
+        if offer is not None and caller.node_id != ANONYMOUS.node_id:
+            # Bill for the work. The receipt is signed here, at the point the
+            # numbers are actually known — reconstructing it later would be
+            # reconstructing the provider's own claim about itself.
+            receipt = build_receipt(
+                self.identity,
+                job_id=req.session_id,
+                step_number=req.step_number,
+                consumer_node_id=caller.node_id,
+                offer=offer,
+                request_hash=request_fingerprint(req.prompt, req.max_tokens, offering.model),
+                response_text=text,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                latency_ms=latency_ms,
+            )
+            payload["receipt"] = receipt.model_dump()
+            if self.store is not None:
+                try:
+                    # Record it unacknowledged; the consumer countersigns its copy.
+                    self.store.upsert_receipt(receipt.to_row())
+                except Exception:
+                    pass
+
+        return payload
 
     def _log_request(self, info: WorkerInfo, session_id: str, latency_ms: int, *, success: bool) -> None:
         self.total_requests += 1
@@ -415,6 +445,17 @@ class Provider:
             )
         except Exception:
             pass
+
+    def earnings(self) -> dict[str, Any]:
+        if self.store is None:
+            return {"acknowledged": 0.0, "unacknowledged": 0.0, "disputed": 0.0, "receipts": 0}
+        rows = self.store.list_receipts(provider_node_id=self.identity.node_id)
+        totals = {"acknowledged": 0.0, "unacknowledged": 0.0, "disputed": 0.0}
+        for row in rows:
+            bucket = str(row.get("status", "unacknowledged"))
+            if bucket in totals:
+                totals[bucket] += float(row.get("amount_credits") or 0)
+        return {**{k: round(v, 6) for k, v in totals.items()}, "receipts": len(rows)}
 
     def status(self) -> dict[str, Any]:
         one_minute_ago = now_utc() - timedelta(minutes=1)
@@ -539,6 +580,13 @@ def create_app(
     @app.get("/inference/status")
     def inference_status() -> dict[str, Any]:
         return provider.status()
+
+    @app.get("/earnings")
+    def earnings(who: SignedBy = Depends(caller)) -> dict[str, Any]:
+        """What this provider has earned, and what is still unacknowledged."""
+        if who.node_id != provider.identity.node_id:
+            raise HTTPException(status_code=403, detail="not_your_earnings")
+        return provider.earnings()
 
     return app
 
