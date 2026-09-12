@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +12,15 @@ class Problem:
     step_number: int
     topic: str
     prompt: str
+
+
+@dataclass
+class Task:
+    """A job: what to do, and what it needs from the market to do it."""
+
+    goal: str
+    steps: list[Problem]
+    requirements: dict[str, Any] = field(default_factory=dict)
 
 
 # Default built-in problems kept for backwards compatibility / demo use.
@@ -84,19 +93,28 @@ _DEFAULT_PROBLEMS: list[Problem] = [
 _DEFAULT_GOAL = "Solve 5 complex math and logic problems"
 
 
-def load_problems_from_file(path: str) -> tuple[str, list[Problem]]:
-    """Load task goal and steps from a YAML file.
+def load_task(path: str) -> Task:
+    """Load a task from YAML.
 
     Expected format::
 
         goal: "Describe your overall task"
+
+        # Optional. What this job needs from the market; anything omitted is
+        # not a constraint. Without this block the consumer takes the cheapest
+        # provider that can serve it.
+        requirements:
+          model: llama3
+          max_price_out_per_1k: 0.20
+          min_context_window: 8192
+          region: home-lab
+          budget_credits: 5.0
+
         steps:
           - topic: "Step name"
             prompt: "Full prompt text sent to the LLM"
-          - topic: "Another step"
-            prompt: "..."
     """
-    data: dict[str, Any] = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    data: dict[str, Any] = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     goal: str = str(data.get("goal", "Custom task"))
     raw_steps: list[dict[str, str]] = data.get("steps", [])
     if not raw_steps:
@@ -109,11 +127,21 @@ def load_problems_from_file(path: str) -> tuple[str, list[Problem]]:
         )
         for i, step in enumerate(raw_steps)
     ]
-    return goal, problems
+    return Task(goal=goal, steps=problems, requirements=dict(data.get("requirements") or {}))
+
+
+def load_problems_from_file(path: str) -> tuple[str, list[Problem]]:
+    """Goal and steps only. Kept for callers that predate job requirements."""
+    task = load_task(path)
+    return task.goal, task.steps
 
 
 def get_default_problems() -> tuple[str, list[Problem]]:
     return _DEFAULT_GOAL, list(_DEFAULT_PROBLEMS)
+
+
+def default_task() -> Task:
+    return Task(goal=_DEFAULT_GOAL, steps=list(_DEFAULT_PROBLEMS), requirements={})
 
 
 def get_problem(problems: list[Problem], step_number: int) -> Problem:

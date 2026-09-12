@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,8 +21,11 @@ import pytest
 import requests
 import yaml
 
+from relay.identity import Identity
 from relay.inference.backends import FakeBackend
 from relay.inference.registry import Registry, create_app
+from relay.provider.config import ModelOffering, ProviderConfig
+from relay.provider.server import Provider
 from relay.store import FileStore
 
 
@@ -31,11 +35,17 @@ def free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _noop() -> None:
+    return None
+
+
 @dataclass
 class RegistryServer:
     url: str
     registry: Registry
     backend: FakeBackend
+    stop: Callable[[], None] = _noop
+    provider_node_id: str = ""
 
 
 @pytest.fixture
@@ -73,8 +83,18 @@ def registry_server(tmp_path: Path):
         else:
             raise RuntimeError("registry did not come up")
 
+        def stop() -> None:
+            server.should_exit = True
+            thread.join(timeout=10)
+
         started.append((server, thread))
-        return RegistryServer(url=url, registry=registry, backend=backend)
+        return RegistryServer(
+            url=url,
+            registry=registry,
+            backend=backend,
+            stop=stop,
+            provider_node_id=registry.identity.node_id,
+        )
 
     started: list = []
     yield _start
@@ -143,6 +163,8 @@ def spawn_worker(tmp_path: Path):
         worker_id: str = "worker-alpha",
         machine_id: str = "machine-test",
         step_sleep: int = 0,
+        max_retries: int = 3,
+        policy: str = "cheapest",
     ) -> WorkerProcess:
         env = dict(os.environ)
         env.update(
@@ -152,7 +174,11 @@ def spawn_worker(tmp_path: Path):
                 "RELAY_STORE": "file",
                 "RELAY_STORE_PATH": str(store.path),
                 "RELAY_OUTPUT_DIR": str(tmp_path / "output"),
-                "INFERENCE_REGISTRY": registry_url,
+                # Empty means "shop the directory" rather than "use this node".
+                "INFERENCE_REGISTRY": registry_url or "",
+                "RELAY_MAX_RETRIES": str(max_retries),
+                "RELAY_POLICY": policy,
+                "RELAY_FAILOVER_COOLDOWN": "300",
                 "WORKER_ID": worker_id,
                 "MACHINE_ID": machine_id,
                 "SESSION_ID": session_id,
@@ -176,3 +202,77 @@ def spawn_worker(tmp_path: Path):
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
+
+
+@pytest.fixture
+def market(tmp_path):
+    """Run one or more real providers advertising into a shared directory."""
+    import uvicorn
+
+    from relay.provider.server import create_app as create_provider_app
+
+    running: list = []
+
+    def _start(
+        store: FileStore,
+        *,
+        name: str,
+        model: str = "llama3",
+        price_out: float = 0.10,
+        price_in: float = 0.02,
+        latency_ms: int = 0,
+        max_concurrency: int = 8,
+        region: str = "lab",
+        context_window: int = 8192,
+    ) -> RegistryServer:
+        port = free_port()
+        endpoint = f"http://127.0.0.1:{port}"
+        backend = FakeBackend(latency_ms=latency_ms, available_models=[model])
+        provider = Provider(
+            ProviderConfig(
+                endpoint_url=endpoint,
+                region=region,
+                offer_ttl_seconds=300,
+                models=[
+                    ModelOffering(model, "fake", context_window, price_in, price_out, max_concurrency)
+                ],
+                backends={"fake": backend},
+            ),
+            store,
+            identity=Identity.load_or_create(tmp_path / f"{name}.key"),
+            node_id=name,
+        )
+        app = create_provider_app(provider, prune_in_background=False)
+        cfg = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+        server = uvicorn.Server(cfg)
+        server.install_signal_handlers = lambda: None
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                if requests.get(f"{endpoint}/health", timeout=1).ok:
+                    break
+            except requests.RequestException:
+                time.sleep(0.02)
+        else:
+            raise RuntimeError(f"provider {name} did not come up")
+
+        def stop() -> None:
+            server.should_exit = True
+            thread.join(timeout=10)
+
+        running.append((server, thread))
+        return RegistryServer(
+            url=endpoint,
+            registry=provider,
+            backend=backend,
+            stop=stop,
+            provider_node_id=provider.identity.node_id,
+        )
+
+    yield _start
+    for server, thread in running:
+        server.should_exit = True
+        thread.join(timeout=5)

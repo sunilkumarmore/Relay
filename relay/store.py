@@ -90,6 +90,7 @@ class Store(Protocol):
         machine_id: str,
         inference_node: str,
         status: str,
+        provider_node_id: str = "",
     ) -> None: ...
 
     def list_worker_state(self) -> list[dict[str, Any]]: ...
@@ -199,6 +200,20 @@ class Store(Protocol):
         self, provider_node_id: str | None = None, kind: str | None = None, limit: int = 100
     ) -> list[dict[str, Any]]: ...
 
+    # -- provider health (what consumers actually observed) ---------------
+    def insert_provider_health(
+        self,
+        observer_node_id: str,
+        provider_node_id: str,
+        ok: bool,
+        latency_ms: int | None = None,
+        error: str = "",
+    ) -> None: ...
+
+    def list_provider_health(
+        self, provider_node_id: str | None = None, limit: int = 200
+    ) -> list[dict[str, Any]]: ...
+
     def reset_session(self, session_id: str) -> None: ...
 
 
@@ -292,6 +307,7 @@ class SupabaseStore:
         machine_id: str,
         inference_node: str,
         status: str,
+        provider_node_id: str = "",
     ) -> None:
         self.client.table("relay_worker_state").upsert(
             {
@@ -301,6 +317,7 @@ class SupabaseStore:
                 "next_problem": next_problem,
                 "machine_id": machine_id,
                 "inference_node": inference_node,
+                "provider_node_id": provider_node_id,
                 "status": status,
                 "updated_at": now_iso(),
             },
@@ -541,6 +558,33 @@ class SupabaseStore:
         data = query.order("occurred_at", desc=True).limit(limit).execute().data
         return list(reversed(list(data or [])))
 
+    def insert_provider_health(
+        self,
+        observer_node_id: str,
+        provider_node_id: str,
+        ok: bool,
+        latency_ms: int | None = None,
+        error: str = "",
+    ) -> None:
+        self.client.table("relay_provider_health").insert(
+            {
+                "observer_node_id": observer_node_id,
+                "provider_node_id": provider_node_id,
+                "ok": ok,
+                "latency_ms": latency_ms,
+                "error": error,
+            }
+        ).execute()
+
+    def list_provider_health(
+        self, provider_node_id: str | None = None, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        query = self.client.table("relay_provider_health").select("*")
+        if provider_node_id is not None:
+            query = query.eq("provider_node_id", provider_node_id)
+        data = query.order("observed_at", desc=True).limit(limit).execute().data
+        return list(data or [])
+
     def reset_session(self, session_id: str) -> None:
         for table in (
             "relay_worker_state",
@@ -564,6 +608,7 @@ TABLES = (
     "registry_requests",
     "offers",
     "provider_events",
+    "provider_health",
 )
 
 
@@ -678,6 +723,7 @@ class MemoryStore:
         machine_id: str,
         inference_node: str,
         status: str,
+        provider_node_id: str = "",
     ) -> None:
         record = {
             "session_id": session_id,
@@ -686,6 +732,7 @@ class MemoryStore:
             "next_problem": next_problem,
             "machine_id": machine_id,
             "inference_node": inference_node,
+            "provider_node_id": provider_node_id,
             "status": status,
             "updated_at": now_iso(),
         }
@@ -940,6 +987,38 @@ class MemoryStore:
         ]
         rows.sort(key=lambda r: str(r.get("occurred_at", "")))
         return rows[-limit:]
+
+    def insert_provider_health(
+        self,
+        observer_node_id: str,
+        provider_node_id: str,
+        ok: bool,
+        latency_ms: int | None = None,
+        error: str = "",
+    ) -> None:
+        with self._txn():
+            self.tables["provider_health"].append(
+                {
+                    "observer_node_id": observer_node_id,
+                    "provider_node_id": provider_node_id,
+                    "ok": ok,
+                    "latency_ms": latency_ms,
+                    "error": error,
+                    "observed_at": now_iso(),
+                }
+            )
+
+    def list_provider_health(
+        self, provider_node_id: str | None = None, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        tables = self._view()
+        rows = [
+            dict(r)
+            for r in tables["provider_health"]
+            if provider_node_id is None or r.get("provider_node_id") == provider_node_id
+        ]
+        rows.sort(key=lambda r: str(r.get("observed_at", "")), reverse=True)
+        return rows[:limit]
 
     def reset_session(self, session_id: str) -> None:
         with self._txn():
