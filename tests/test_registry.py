@@ -18,7 +18,7 @@ def parts():
     backend = FakeBackend()
     store = MemoryStore()
     registry = Registry(backend, store, node_id="node-1")
-    with TestClient(create_app(registry, prune_in_background=False)) as client:
+    with TestClient(create_app(registry, prune_in_background=False, require_signatures=False)) as client:
         yield client, registry, backend, store
 
 
@@ -138,7 +138,7 @@ def test_status_summarizes_recent_calls(parts):
 def test_registry_runs_without_a_store():
     """Telemetry is best-effort; a node with no store still serves inference."""
     registry = Registry(FakeBackend(), None, node_id="n")
-    with TestClient(create_app(registry, prune_in_background=False)) as client:
+    with TestClient(create_app(registry, prune_in_background=False, require_signatures=False)) as client:
         client.post("/worker/register", json=REGISTER)
         assert client.post("/inference/complete", json=COMPLETE).status_code == 200
 
@@ -149,7 +149,7 @@ def test_store_failure_does_not_fail_the_request():
             raise RuntimeError("supabase is down")
 
     registry = Registry(FakeBackend(), ExplodingStore(), node_id="n")
-    with TestClient(create_app(registry, prune_in_background=False)) as client:
+    with TestClient(create_app(registry, prune_in_background=False, require_signatures=False)) as client:
         client.post("/worker/register", json=REGISTER)
         assert client.post("/inference/complete", json=COMPLETE).status_code == 200
 
@@ -163,7 +163,7 @@ def test_health_check_is_cached():
             return True
 
     registry = Registry(CountingBackend(), None, node_id="n")
-    with TestClient(create_app(registry, prune_in_background=False)) as client:
+    with TestClient(create_app(registry, prune_in_background=False, require_signatures=False)) as client:
         for _ in range(5):
             client.get("/health")
     assert calls["n"] == 1, "each /health poll should not hit the backend"

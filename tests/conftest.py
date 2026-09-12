@@ -43,10 +43,18 @@ def registry_server(tmp_path: Path):
     """A real registry on loopback, backed by FakeBackend and a FileStore."""
     import uvicorn
 
-    def _start(store: FileStore, *, latency_ms: int = 0, node_id: str = "test-node") -> RegistryServer:
+    def _start(
+        store: FileStore,
+        *,
+        latency_ms: int = 0,
+        node_id: str = "test-node",
+        require_signatures: bool = True,
+    ) -> RegistryServer:
         backend = FakeBackend(latency_ms=latency_ms)
         registry = Registry(backend, store, node_id=node_id)
-        app = create_app(registry, prune_in_background=False)
+        app = create_app(
+            registry, prune_in_background=False, require_signatures=require_signatures
+        )
         port = free_port()
         cfg = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
         server = uvicorn.Server(cfg)
@@ -140,6 +148,7 @@ def spawn_worker(tmp_path: Path):
         env.update(
             {
                 "ENV_FILE": str(tmp_path / "nonexistent.env"),
+                "RELAY_KEY_PATH": str(tmp_path / f"{worker_id}.key"),
                 "RELAY_STORE": "file",
                 "RELAY_STORE_PATH": str(store.path),
                 "RELAY_OUTPUT_DIR": str(tmp_path / "output"),

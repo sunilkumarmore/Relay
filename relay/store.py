@@ -140,6 +140,39 @@ class Store(Protocol):
 
     def list_migration_events(self, limit: int = 20) -> list[dict[str, Any]]: ...
 
+    # -- registry (durable node registrations and request log) ------------
+    def upsert_node(
+        self,
+        worker_id: str,
+        node_id: str,
+        session_id: str,
+        machine_id: str,
+        inference_node: str,
+        steps_completed: int,
+        last_heartbeat: str,
+        registered_at: str | None = None,
+    ) -> None: ...
+
+    def get_node(self, worker_id: str) -> dict[str, Any] | None: ...
+
+    def list_nodes(self, inference_node: str | None = None) -> list[dict[str, Any]]: ...
+
+    def delete_node(self, worker_id: str) -> None: ...
+
+    def insert_registry_request(
+        self,
+        worker_id: str,
+        node_id: str,
+        session_id: str,
+        inference_node: str,
+        latency_ms: int,
+        success: bool,
+    ) -> None: ...
+
+    def list_registry_requests(
+        self, inference_node: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]: ...
+
     def reset_session(self, session_id: str) -> None: ...
 
 
@@ -357,19 +390,105 @@ class SupabaseStore:
         )
         return list(data or [])
 
+    def upsert_node(
+        self,
+        worker_id: str,
+        node_id: str,
+        session_id: str,
+        machine_id: str,
+        inference_node: str,
+        steps_completed: int,
+        last_heartbeat: str,
+        registered_at: str | None = None,
+    ) -> None:
+        record = {
+            "worker_id": worker_id,
+            "node_id": node_id,
+            "session_id": session_id,
+            "machine_id": machine_id,
+            "inference_node": inference_node,
+            "steps_completed": steps_completed,
+            "last_heartbeat": last_heartbeat,
+        }
+        if registered_at is not None:
+            record["registered_at"] = registered_at
+        self.client.table("relay_nodes").upsert(record, on_conflict="worker_id").execute()
+
+    def get_node(self, worker_id: str) -> dict[str, Any] | None:
+        rows = (
+            self.client.table("relay_nodes")
+            .select("*")
+            .eq("worker_id", worker_id)
+            .limit(1)
+            .execute()
+            .data
+        )
+        return rows[0] if rows else None
+
+    def list_nodes(self, inference_node: str | None = None) -> list[dict[str, Any]]:
+        query = self.client.table("relay_nodes").select("*")
+        if inference_node is not None:
+            query = query.eq("inference_node", inference_node)
+        return list(query.execute().data or [])
+
+    def delete_node(self, worker_id: str) -> None:
+        self.client.table("relay_nodes").delete().eq("worker_id", worker_id).execute()
+
+    def insert_registry_request(
+        self,
+        worker_id: str,
+        node_id: str,
+        session_id: str,
+        inference_node: str,
+        latency_ms: int,
+        success: bool,
+    ) -> None:
+        self.client.table("relay_registry_requests").insert(
+            {
+                "worker_id": worker_id,
+                "node_id": node_id,
+                "session_id": session_id,
+                "inference_node": inference_node,
+                "latency_ms": latency_ms,
+                "success": success,
+            }
+        ).execute()
+
+    def list_registry_requests(
+        self, inference_node: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        query = self.client.table("relay_registry_requests").select("*")
+        if inference_node is not None:
+            query = query.eq("inference_node", inference_node)
+        data = query.order("requested_at", desc=True).limit(limit).execute().data
+        return list(reversed(list(data or [])))
+
     def reset_session(self, session_id: str) -> None:
         for table in (
             "relay_worker_state",
             "relay_checkpoints",
             "relay_migration_log",
             "relay_inference_log",
+            "relay_nodes",
+            "relay_registry_requests",
             "relay_sessions",
         ):
             self.client.table(table).delete().eq("session_id", session_id).execute()
 
 
+TABLES = (
+    "sessions",
+    "worker_state",
+    "checkpoints",
+    "inference_log",
+    "migration_log",
+    "nodes",
+    "registry_requests",
+)
+
+
 def _empty_tables() -> dict[str, list[dict[str, Any]]]:
-    return {"sessions": [], "worker_state": [], "checkpoints": [], "inference_log": [], "migration_log": []}
+    return {name: [] for name in TABLES}
 
 
 class MemoryStore:
@@ -593,6 +712,89 @@ class MemoryStore:
             reverse=True,
         )
         return rows[:limit]
+
+    def upsert_node(
+        self,
+        worker_id: str,
+        node_id: str,
+        session_id: str,
+        machine_id: str,
+        inference_node: str,
+        steps_completed: int,
+        last_heartbeat: str,
+        registered_at: str | None = None,
+    ) -> None:
+        record = {
+            "worker_id": worker_id,
+            "node_id": node_id,
+            "session_id": session_id,
+            "machine_id": machine_id,
+            "inference_node": inference_node,
+            "steps_completed": steps_completed,
+            "last_heartbeat": last_heartbeat,
+        }
+        with self._txn():
+            for row in self.tables["nodes"]:
+                if row["worker_id"] == worker_id:
+                    row.update(record)
+                    if registered_at is not None:
+                        row.setdefault("registered_at", registered_at)
+                    return
+            record["registered_at"] = registered_at or last_heartbeat
+            self.tables["nodes"].append(record)
+
+    def get_node(self, worker_id: str) -> dict[str, Any] | None:
+        self._refresh()
+        for row in self.tables["nodes"]:
+            if row["worker_id"] == worker_id:
+                return dict(row)
+        return None
+
+    def list_nodes(self, inference_node: str | None = None) -> list[dict[str, Any]]:
+        self._refresh()
+        return [
+            dict(r)
+            for r in self.tables["nodes"]
+            if inference_node is None or r.get("inference_node") == inference_node
+        ]
+
+    def delete_node(self, worker_id: str) -> None:
+        with self._txn():
+            self.tables["nodes"] = [r for r in self.tables["nodes"] if r["worker_id"] != worker_id]
+
+    def insert_registry_request(
+        self,
+        worker_id: str,
+        node_id: str,
+        session_id: str,
+        inference_node: str,
+        latency_ms: int,
+        success: bool,
+    ) -> None:
+        with self._txn():
+            self.tables["registry_requests"].append(
+                {
+                    "worker_id": worker_id,
+                    "node_id": node_id,
+                    "session_id": session_id,
+                    "inference_node": inference_node,
+                    "latency_ms": latency_ms,
+                    "success": success,
+                    "requested_at": now_iso(),
+                }
+            )
+
+    def list_registry_requests(
+        self, inference_node: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        self._refresh()
+        rows = [
+            dict(r)
+            for r in self.tables["registry_requests"]
+            if inference_node is None or r.get("inference_node") == inference_node
+        ]
+        rows.sort(key=lambda r: str(r.get("requested_at", "")))
+        return rows[-limit:]
 
     def reset_session(self, session_id: str) -> None:
         with self._txn():

@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 import requests
 
+from relay.identity import Identity
 from relay.worker import daemon
 from relay.worker.daemon import Runtime, WorkerConfig, call_inference
 
@@ -13,6 +14,7 @@ CFG = WorkerConfig(
     worker_id="w1",
     session_id="s1",
     machine_id="m1",
+    identity=Identity.generate(),
 )
 RUNTIME = Runtime(
     worker_id="w1",
@@ -113,7 +115,7 @@ def test_401_re_registers_and_retries_within_the_same_attempt(monkeypatch, no_sl
     """The registry restarted or pruned us as stale — say hello again."""
     posts: list[str] = []
 
-    def post(url, json=None, timeout=None):
+    def post(url, json=None, timeout=None, auth=None):
         posts.append(url)
         if url.endswith("/worker/register"):
             return FakeResponse(200, {"inference_node_id": "n1"})

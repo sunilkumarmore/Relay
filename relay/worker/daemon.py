@@ -17,6 +17,8 @@ from typing import Any
 import requests
 
 from relay import config
+from relay.auth import RelayAuth
+from relay.identity import Identity, identity_from_env
 from relay.store import RelayStoreError, Store, store_from_env
 from relay.worker.eviction import EvictionManager, EvictionState
 from relay.worker.tasks import Problem, get_default_problems, get_problem, load_problems_from_file
@@ -31,6 +33,13 @@ class WorkerConfig:
     worker_id: str
     session_id: str
     machine_id: str
+    identity: Identity
+
+    @property
+    def auth(self) -> RelayAuth:
+        """Signs every call to a provider. The node id is the real identity;
+        worker_id and machine_id are just labels."""
+        return RelayAuth(self.identity)
 
 
 @dataclass
@@ -79,6 +88,7 @@ def load_config() -> WorkerConfig:
         worker_id=worker_id,
         session_id=session_id,
         machine_id=machine_id,
+        identity=identity_from_env(),
     )
 
 
@@ -116,7 +126,9 @@ def register_worker(cfg: WorkerConfig) -> str:
         "session_id": cfg.session_id,
         "machine_id": cfg.machine_id,
     }
-    response = requests.post(f"{cfg.inference_registry}/worker/register", json=payload, timeout=10)
+    response = requests.post(
+        f"{cfg.inference_registry}/worker/register", json=payload, timeout=10, auth=cfg.auth
+    )
     response.raise_for_status()
     return str(response.json().get("inference_node_id", "unknown"))
 
@@ -129,7 +141,9 @@ def send_heartbeat(stop_event: threading.Event, cfg: WorkerConfig, runtime: Runt
             "steps_completed": runtime.steps_completed,
         }
         try:
-            requests.post(f"{cfg.inference_registry}/worker/heartbeat", json=payload, timeout=5)
+            requests.post(
+                f"{cfg.inference_registry}/worker/heartbeat", json=payload, timeout=5, auth=cfg.auth
+            )
         except Exception:
             pass
         stop_event.wait(HEARTBEAT_INTERVAL_SECONDS)
@@ -141,6 +155,7 @@ def deregister_worker(cfg: WorkerConfig) -> None:
             f"{cfg.inference_registry}/worker/deregister",
             json={"worker_id": cfg.worker_id},
             timeout=5,
+            auth=cfg.auth,
         )
     except Exception:
         pass
@@ -172,10 +187,14 @@ def call_inference(
 
     for attempt in range(max_retries + 1):
         try:
-            response = requests.post(url, json=payload, timeout=INFERENCE_TIMEOUT_SECONDS)
+            response = requests.post(
+                url, json=payload, timeout=INFERENCE_TIMEOUT_SECONDS, auth=cfg.auth
+            )
             if response.status_code == 401:
                 register_worker(cfg)
-                response = requests.post(url, json=payload, timeout=INFERENCE_TIMEOUT_SECONDS)
+                response = requests.post(
+                    url, json=payload, timeout=INFERENCE_TIMEOUT_SECONDS, auth=cfg.auth
+                )
             response.raise_for_status()
             return response.json()
         except (requests.ConnectionError, requests.Timeout) as exc:
