@@ -14,7 +14,7 @@ from relay.provider.config import ModelOffering, ProviderConfig
 from relay.provider.offers import Offer
 from relay.provider.server import Provider, create_app
 from relay.store import MemoryStore
-from tests.test_auth import REGISTER, post
+from tests.helpers import REGISTER, post
 
 CHEAP = ModelOffering("mistral", "fake", 4096, 0.01, 0.03, max_concurrency=2)
 DEAR = ModelOffering("llama3", "fake", 8192, 0.05, 0.15, max_concurrency=1)

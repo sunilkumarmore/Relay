@@ -13,7 +13,7 @@ from relay.identity import Identity
 from relay.inference.backends import FakeBackend
 from relay.inference.registry import Registry, create_app
 from relay.store import FileStore, MemoryStore
-from tests.test_auth import COMPLETE, REGISTER, post
+from tests.helpers import COMPLETE, REGISTER, post
 
 
 def test_registrations_survive_a_restart():

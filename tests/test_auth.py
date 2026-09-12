@@ -14,27 +14,13 @@ from relay.auth import (
     SIGNATURE_HEADER,
     TIMESTAMP_HEADER,
     RelayAuth,
-    canonical_message,
     verify_headers,
 )
 from relay.identity import Identity
 from relay.inference.backends import FakeBackend
 from relay.inference.registry import Registry, create_app
 from relay.store import MemoryStore
-
-REGISTER = {"worker_id": "w1", "session_id": "s1", "machine_id": "m1"}
-COMPLETE = {"worker_id": "w1", "session_id": "s1", "prompt": "hello", "max_tokens": 32}
-
-
-def sign_headers(identity: Identity, method: str, path: str, body: bytes, *, timestamp=None):
-    stamp = str(timestamp if timestamp is not None else int(time.time()))
-    message = canonical_message(method, path, stamp, body)
-    return {
-        NODE_HEADER: identity.node_id,
-        TIMESTAMP_HEADER: stamp,
-        SIGNATURE_HEADER: identity.sign(message).hex(),
-    }
-
+from tests.helpers import COMPLETE, REGISTER, post, sign_headers
 
 # -- the primitive ---------------------------------------------------------
 
@@ -130,17 +116,6 @@ def signed_registry():
     registry = Registry(FakeBackend(), MemoryStore(), node_id="node-1")
     with TestClient(create_app(registry, prune_in_background=False)) as client:
         yield client, registry
-
-
-def post(client, path, payload, identity):
-    import json
-
-    body = json.dumps(payload).encode()
-    return client.post(
-        path,
-        content=body,
-        headers={"content-type": "application/json", **sign_headers(identity, "POST", path, body)},
-    )
 
 
 def test_unsigned_inference_is_rejected(signed_registry):

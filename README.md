@@ -353,6 +353,10 @@ ruff check .
 pytest
 ```
 
+Run it as `pytest`, the way CI does — not `python -m pytest`, which silently
+adds the working directory to `sys.path` and can hide an import that only
+resolves locally.
+
 The test suite needs no Supabase project, no Ollama, and no network. Two
 substitutions make that possible:
 
