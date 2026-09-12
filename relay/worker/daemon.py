@@ -336,6 +336,9 @@ def run_worker(
         status="in_progress",
         current_machine=cfg.machine_id,
         inference_node=runtime.inference_node,
+        # The consumer node that owns this job. Row-level security scopes every
+        # write on the session and its children to this identity.
+        owner_node_id=cfg.identity.node_id,
     )
     store.insert_migration_event(
         session_id=cfg.session_id,

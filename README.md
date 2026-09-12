@@ -37,6 +37,9 @@ What holds it together:
 - **Agent state** (`relay/agent/`) — the conversation, intermediate results and
   artifacts, hashed and checkpointed after every step, so a resumed run picks up
   the agent rather than just the step counter.
+- **Token authority** (`relay/authority/`) — turns a node's Ed25519 identity
+  into a short-lived database token, so row-level security can be written
+  against *which node* is asking.
 
 Two ways to run it: **pinned**, where a worker is pointed at one provider (the
 two-machine demo below), or **market**, where it discovers providers, picks by
@@ -58,8 +61,47 @@ Machine 1 (inference node) also needs:
 
 1. Create a project at [supabase.com](https://supabase.com)
 2. Open the SQL Editor
-3. Run `setup/supabase_setup.sql`
+3. Run `setup/supabase_setup.sql`, then migrations `002` through `008` **in order**
 4. Copy your project URL and anon key
+
+### Row-level security needs the token authority
+
+Migrations 002 and 008 turn on RLS. From that point the anon key reaches almost
+nothing on its own: every policy is written against a `relay_node_id` claim, and
+only the token authority can mint one. **Apply those migrations without running
+an authority and your nodes will be locked out of the database.**
+
+The authority is the one component that holds the project's JWT secret. Run it
+somewhere your nodes can reach, and nowhere else:
+
+```bash
+# On the authority host only
+export RELAY_JWT_SECRET=<Supabase → Settings → API → JWT Settings>
+python -m relay.authority           # listens on :8790
+```
+
+Then point every node at it:
+
+```bash
+# On each worker, provider, controller and dashboard
+export RELAY_AUTHORITY_URL=http://<authority-host>:8790
+```
+
+A node signs a server-issued challenge with its key and gets back a token
+carrying its node id, refreshed automatically before it expires. Nothing but the
+authority ever sees the JWT secret, and a node only ever receives a credential
+for itself.
+
+Check it end to end with:
+
+```bash
+python -m relay.controller wallet balance     # any command that touches the store
+```
+
+**Running without it.** Leave `RELAY_AUTHORITY_URL` unset and nodes connect with
+`SUPABASE_KEY` as before. That is fine for a single-operator demo, and it is the
+only thing that works if you have not applied 002 — but it means any holder of
+the key can read and write everything.
 
 ## Machine 1 Setup (Inference Node)
 

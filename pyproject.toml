@@ -19,6 +19,7 @@ dependencies = [
     "requests==2.31.0",
     "pyyaml==6.0.1",
     "cryptography>=41",
+    "pyjwt>=2.6",
 ]
 
 [project.optional-dependencies]
@@ -29,6 +30,8 @@ relay-worker = "relay.worker.daemon:run"
 relay-inference = "relay.inference.registry:run"
 relay-controller = "relay.controller.cli:cli"
 relay-dashboard = "relay.dashboard.tui:run"
+relay-provider = "relay.provider.server:run"
+relay-authority = "relay.authority.server:run"
 
 [tool.setuptools.packages.find]
 include = ["relay*"]

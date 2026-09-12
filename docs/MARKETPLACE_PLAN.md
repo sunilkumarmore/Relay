@@ -18,12 +18,25 @@ Phases 0-6 are **built**. Phase 7 (CLI and web surfaces) and Phase 8
 | 4 Ledger | done | Signed receipts, token bound, double-entry credits |
 | 5 Reputation | done | Deterministic scores, adjudicated disputes, stake and slashing |
 | 6 Stateful agent | done | Context between steps, hashed agent state, compaction, dependencies |
+| 6.5 Token authority | done | The JWT exchange migration 002 assumed but never had, plus write policies scoped to the session owner |
 | 7 Surfaces | **next** | `relay` CLI, web market dashboard, docker compose |
 | 8 Hardening | pending | TLS, rate limits, metrics, chaos runs |
 
 With Phase 6 in, Relay is a resumable *agent* rather than a resumable queue:
 steps share one conversation, quote each other's answers, and a run killed
 without warning resumes into the same conversation it would have had.
+
+Phase 6.5 was not in the original plan. Migration 002 wrote RLS policies against
+a JWT claim that nothing in the codebase produced, so applying it would have
+locked the application out of its own database — and its write policies were
+loose enough that any node could rewrite any other session. Both are fixed in
+`relay/authority/` and migration 008.
+
+The largest remaining gap is not a phase: **no Supabase code path has ever
+executed.** Every test runs against MemoryStore or FileStore. `SupabaseStore`,
+the `on_conflict` clauses, the ledger trigger and the RLS policies are all
+unverified. Integration tests against a local `supabase start` stack should come
+before Phase 7.
 
 ## How to use this document
 

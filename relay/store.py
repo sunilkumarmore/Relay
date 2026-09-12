@@ -72,6 +72,7 @@ class Store(Protocol):
         current_machine: str,
         inference_node: str,
         final_report: str | None = None,
+        owner_node_id: str = "",
     ) -> None: ...
 
     def update_session(self, session_id: str, **updates: Any) -> None: ...
@@ -292,29 +293,65 @@ class Store(Protocol):
 
 
 class SupabaseStore:
-    """Store backed by the ``relay_*`` tables in a Supabase project."""
+    """Store backed by the ``relay_*`` tables in a Supabase project.
 
-    def __init__(self, supabase_url: str, supabase_key: str) -> None:
+    With row-level security on, the anon key alone reaches nothing: every policy
+    is written against a ``relay_node_id`` claim that only the token authority
+    can produce. When a ``token_provider`` is supplied, each call goes out under
+    a token carrying this node's identity; without one, the store falls back to
+    the configured key, which is how a single-operator deployment runs before
+    migration 002 is applied.
+    """
+
+    def __init__(
+        self,
+        supabase_url: str,
+        supabase_key: str,
+        token_provider: Any | None = None,
+    ) -> None:
         if not supabase_url or not supabase_key:
             raise RelayStoreError(CONNECT_HELP)
         from supabase import create_client
 
         self.client = create_client(supabase_url, supabase_key)
+        self.token_provider = token_provider
+        self._attached_token: str | None = None
 
     @classmethod
     def from_env(cls, env_path: str | None = None) -> SupabaseStore:
         config.load_env(env_path)
-        return cls(config.get("SUPABASE_URL"), config.get("SUPABASE_KEY"))
+        from relay.authority.client import provider_from_env
+
+        return cls(
+            config.get("SUPABASE_URL"),
+            config.get("SUPABASE_KEY"),
+            token_provider=provider_from_env(),
+        )
+
+    def _db(self):
+        """The client, carrying a current token.
+
+        Called before every request rather than once at construction: tokens are
+        deliberately short-lived, and a long-running worker would otherwise be
+        holding an expired credential by its third step.
+        """
+        if self.token_provider is None:
+            return self.client
+        token = self.token_provider.token()
+        if token != self._attached_token:
+            self.client.postgrest.auth(token)
+            self._attached_token = token
+        return self.client
 
     def verify_connection(self) -> None:
         try:
-            self.client.table("relay_sessions").select("id").limit(1).execute()
+            self._db().table("relay_sessions").select("id").limit(1).execute()
         except Exception as exc:
             raise RelayStoreError(CONNECT_HELP) from exc
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:
         rows = (
-            self.client.table("relay_sessions")
+            self._db().table("relay_sessions")
             .select("*")
             .eq("session_id", session_id)
             .limit(1)
@@ -334,10 +371,12 @@ class SupabaseStore:
         current_machine: str,
         inference_node: str,
         final_report: str | None = None,
+        owner_node_id: str = "",
     ) -> None:
-        self.client.table("relay_sessions").upsert(
+        self._db().table("relay_sessions").upsert(
             {
                 "session_id": session_id,
+                "owner_node_id": owner_node_id,
                 "worker_id": worker_id,
                 "task_goal": task_goal,
                 "steps_total": steps_total,
@@ -353,17 +392,17 @@ class SupabaseStore:
 
     def update_session(self, session_id: str, **updates: Any) -> None:
         updates["updated_at"] = now_iso()
-        self.client.table("relay_sessions").update(updates).eq("session_id", session_id).execute()
+        self._db().table("relay_sessions").update(updates).eq("session_id", session_id).execute()
 
     def list_sessions(self) -> list[dict[str, Any]]:
         data = (
-            self.client.table("relay_sessions").select("*").order("updated_at", desc=True).execute().data
+            self._db().table("relay_sessions").select("*").order("updated_at", desc=True).execute().data
         )
         return list(data or [])
 
     def get_state(self, session_id: str) -> dict[str, Any] | None:
         rows = (
-            self.client.table("relay_worker_state")
+            self._db().table("relay_worker_state")
             .select("*")
             .eq("session_id", session_id)
             .limit(1)
@@ -383,7 +422,7 @@ class SupabaseStore:
         status: str,
         provider_node_id: str = "",
     ) -> None:
-        self.client.table("relay_worker_state").upsert(
+        self._db().table("relay_worker_state").upsert(
             {
                 "session_id": session_id,
                 "worker_id": worker_id,
@@ -400,7 +439,7 @@ class SupabaseStore:
 
     def list_worker_state(self) -> list[dict[str, Any]]:
         data = (
-            self.client.table("relay_worker_state")
+            self._db().table("relay_worker_state")
             .select("*")
             .order("updated_at", desc=True)
             .execute()
@@ -410,7 +449,7 @@ class SupabaseStore:
 
     def get_checkpoints(self, session_id: str) -> list[dict[str, Any]]:
         data = (
-            self.client.table("relay_checkpoints")
+            self._db().table("relay_checkpoints")
             .select("*")
             .eq("session_id", session_id)
             .order("step_number")
@@ -439,7 +478,7 @@ class SupabaseStore:
         # Lean on the DB unique constraint on (session_id, step_number) so this is
         # atomic — two workers racing on the same step cannot both succeed.
         result = (
-            self.client.table("relay_checkpoints")
+            self._db().table("relay_checkpoints")
             .upsert(
                 {
                     "session_id": session_id,
@@ -475,7 +514,7 @@ class SupabaseStore:
         tokens_in: int = 0,
         tokens_out: int = 0,
     ) -> None:
-        self.client.table("relay_inference_log").insert(
+        self._db().table("relay_inference_log").insert(
             {
                 "worker_id": worker_id,
                 "session_id": session_id,
@@ -497,7 +536,7 @@ class SupabaseStore:
         to_machine: str | None,
         step_at_event: int,
     ) -> None:
-        self.client.table("relay_migration_log").insert(
+        self._db().table("relay_migration_log").insert(
             {
                 "session_id": session_id,
                 "worker_id": worker_id,
@@ -510,7 +549,7 @@ class SupabaseStore:
 
     def list_migration_events(self, limit: int = 20) -> list[dict[str, Any]]:
         data = (
-            self.client.table("relay_migration_log")
+            self._db().table("relay_migration_log")
             .select("*")
             .order("occurred_at", desc=True)
             .limit(limit)
@@ -541,11 +580,11 @@ class SupabaseStore:
         }
         if registered_at is not None:
             record["registered_at"] = registered_at
-        self.client.table("relay_nodes").upsert(record, on_conflict="worker_id").execute()
+        self._db().table("relay_nodes").upsert(record, on_conflict="worker_id").execute()
 
     def get_node(self, worker_id: str) -> dict[str, Any] | None:
         rows = (
-            self.client.table("relay_nodes")
+            self._db().table("relay_nodes")
             .select("*")
             .eq("worker_id", worker_id)
             .limit(1)
@@ -555,13 +594,13 @@ class SupabaseStore:
         return rows[0] if rows else None
 
     def list_nodes(self, inference_node: str | None = None) -> list[dict[str, Any]]:
-        query = self.client.table("relay_nodes").select("*")
+        query = self._db().table("relay_nodes").select("*")
         if inference_node is not None:
             query = query.eq("inference_node", inference_node)
         return list(query.execute().data or [])
 
     def delete_node(self, worker_id: str) -> None:
-        self.client.table("relay_nodes").delete().eq("worker_id", worker_id).execute()
+        self._db().table("relay_nodes").delete().eq("worker_id", worker_id).execute()
 
     def insert_registry_request(
         self,
@@ -572,7 +611,7 @@ class SupabaseStore:
         latency_ms: int,
         success: bool,
     ) -> None:
-        self.client.table("relay_registry_requests").insert(
+        self._db().table("relay_registry_requests").insert(
             {
                 "worker_id": worker_id,
                 "node_id": node_id,
@@ -586,26 +625,26 @@ class SupabaseStore:
     def list_registry_requests(
         self, inference_node: str | None = None, limit: int = 100
     ) -> list[dict[str, Any]]:
-        query = self.client.table("relay_registry_requests").select("*")
+        query = self._db().table("relay_registry_requests").select("*")
         if inference_node is not None:
             query = query.eq("inference_node", inference_node)
         data = query.order("requested_at", desc=True).limit(limit).execute().data
         return list(reversed(list(data or [])))
 
     def upsert_offer(self, offer: dict[str, Any]) -> None:
-        self.client.table("relay_offers").upsert(offer, on_conflict="offer_id").execute()
+        self._db().table("relay_offers").upsert(offer, on_conflict="offer_id").execute()
 
     def list_offers(self, model: str | None = None) -> list[dict[str, Any]]:
-        query = self.client.table("relay_offers").select("*")
+        query = self._db().table("relay_offers").select("*")
         if model is not None:
             query = query.eq("model", model)
         return list(query.execute().data or [])
 
     def delete_offer(self, offer_id: str) -> None:
-        self.client.table("relay_offers").delete().eq("offer_id", offer_id).execute()
+        self._db().table("relay_offers").delete().eq("offer_id", offer_id).execute()
 
     def delete_offers_for(self, provider_node_id: str) -> None:
-        self.client.table("relay_offers").delete().eq(
+        self._db().table("relay_offers").delete().eq(
             "provider_node_id", provider_node_id
         ).execute()
 
@@ -616,7 +655,7 @@ class SupabaseStore:
         model: str = "",
         detail: dict[str, Any] | None = None,
     ) -> None:
-        self.client.table("relay_provider_events").insert(
+        self._db().table("relay_provider_events").insert(
             {
                 "provider_node_id": provider_node_id,
                 "kind": kind,
@@ -628,7 +667,7 @@ class SupabaseStore:
     def list_provider_events(
         self, provider_node_id: str | None = None, kind: str | None = None, limit: int = 100
     ) -> list[dict[str, Any]]:
-        query = self.client.table("relay_provider_events").select("*")
+        query = self._db().table("relay_provider_events").select("*")
         if provider_node_id is not None:
             query = query.eq("provider_node_id", provider_node_id)
         if kind is not None:
@@ -644,7 +683,7 @@ class SupabaseStore:
         latency_ms: int | None = None,
         error: str = "",
     ) -> None:
-        self.client.table("relay_provider_health").insert(
+        self._db().table("relay_provider_health").insert(
             {
                 "observer_node_id": observer_node_id,
                 "provider_node_id": provider_node_id,
@@ -657,18 +696,18 @@ class SupabaseStore:
     def list_provider_health(
         self, provider_node_id: str | None = None, limit: int = 200
     ) -> list[dict[str, Any]]:
-        query = self.client.table("relay_provider_health").select("*")
+        query = self._db().table("relay_provider_health").select("*")
         if provider_node_id is not None:
             query = query.eq("provider_node_id", provider_node_id)
         data = query.order("observed_at", desc=True).limit(limit).execute().data
         return list(data or [])
 
     def upsert_receipt(self, receipt: dict[str, Any]) -> None:
-        self.client.table("relay_receipts").upsert(receipt, on_conflict="receipt_id").execute()
+        self._db().table("relay_receipts").upsert(receipt, on_conflict="receipt_id").execute()
 
     def get_receipt(self, receipt_id: str) -> dict[str, Any] | None:
         rows = (
-            self.client.table("relay_receipts")
+            self._db().table("relay_receipts")
             .select("*")
             .eq("receipt_id", receipt_id)
             .limit(1)
@@ -685,7 +724,7 @@ class SupabaseStore:
         status: str | None = None,
         limit: int = 500,
     ) -> list[dict[str, Any]]:
-        query = self.client.table("relay_receipts").select("*")
+        query = self._db().table("relay_receipts").select("*")
         for column, value in (
             ("job_id", job_id),
             ("provider_node_id", provider_node_id),
@@ -697,14 +736,14 @@ class SupabaseStore:
         return list(query.limit(limit).execute().data or [])
 
     def upsert_account(self, node_id: str, balance_cached: float, stake: float = 0.0) -> None:
-        self.client.table("relay_accounts").upsert(
+        self._db().table("relay_accounts").upsert(
             {"node_id": node_id, "balance_cached": balance_cached, "stake": stake},
             on_conflict="node_id",
         ).execute()
 
     def get_account(self, node_id: str) -> dict[str, Any] | None:
         rows = (
-            self.client.table("relay_accounts")
+            self._db().table("relay_accounts")
             .select("*")
             .eq("node_id", node_id)
             .limit(1)
@@ -714,7 +753,7 @@ class SupabaseStore:
         return rows[0] if rows else None
 
     def list_accounts(self) -> list[dict[str, Any]]:
-        return list(self.client.table("relay_accounts").select("*").execute().data or [])
+        return list(self._db().table("relay_accounts").select("*").execute().data or [])
 
     def insert_ledger_tx(self, entries: list[dict[str, Any]], idempotency_key: str) -> bool:
         if not entries:
@@ -723,7 +762,7 @@ class SupabaseStore:
         # The unique index on idempotency_key is the guard: if this transaction
         # was already posted, the claim fails and no entries are written.
         claimed = (
-            self.client.table("relay_ledger_tx")
+            self._db().table("relay_ledger_tx")
             .upsert(
                 {"tx_id": tx_id, "idempotency_key": idempotency_key, "kind": entries[0]["kind"]},
                 on_conflict="idempotency_key",
@@ -733,7 +772,7 @@ class SupabaseStore:
         )
         if not claimed.data:
             return False
-        self.client.table("relay_ledger_entries").insert(entries).execute()
+        self._db().table("relay_ledger_entries").insert(entries).execute()
         return True
 
     def list_ledger_entries(
@@ -744,7 +783,7 @@ class SupabaseStore:
         ref_receipt_id: str | None = None,
         limit: int = 1000,
     ) -> list[dict[str, Any]]:
-        query = self.client.table("relay_ledger_entries").select("*")
+        query = self._db().table("relay_ledger_entries").select("*")
         for column, value in (
             ("account", account),
             ("tx_id", tx_id),
@@ -758,7 +797,7 @@ class SupabaseStore:
     def upsert_reputation(
         self, node_id: str, role: str, score: float, components: dict[str, Any], computed_at: str
     ) -> None:
-        self.client.table("relay_reputation").upsert(
+        self._db().table("relay_reputation").upsert(
             {
                 "node_id": node_id,
                 "role": role,
@@ -771,7 +810,7 @@ class SupabaseStore:
 
     def get_reputation(self, node_id: str, role: str = "provider") -> dict[str, Any] | None:
         rows = (
-            self.client.table("relay_reputation")
+            self._db().table("relay_reputation")
             .select("*")
             .eq("node_id", node_id)
             .eq("role", role)
@@ -782,17 +821,17 @@ class SupabaseStore:
         return rows[0] if rows else None
 
     def list_reputation(self, role: str | None = None) -> list[dict[str, Any]]:
-        query = self.client.table("relay_reputation").select("*")
+        query = self._db().table("relay_reputation").select("*")
         if role is not None:
             query = query.eq("role", role)
         return list(query.execute().data or [])
 
     def upsert_dispute(self, dispute: dict[str, Any]) -> None:
-        self.client.table("relay_disputes").upsert(dispute, on_conflict="dispute_id").execute()
+        self._db().table("relay_disputes").upsert(dispute, on_conflict="dispute_id").execute()
 
     def get_dispute(self, dispute_id: str) -> dict[str, Any] | None:
         rows = (
-            self.client.table("relay_disputes")
+            self._db().table("relay_disputes")
             .select("*")
             .eq("dispute_id", dispute_id)
             .limit(1)
@@ -804,7 +843,7 @@ class SupabaseStore:
     def list_disputes(
         self, receipt_id: str | None = None, status: str | None = None, limit: int = 200
     ) -> list[dict[str, Any]]:
-        query = self.client.table("relay_disputes").select("*")
+        query = self._db().table("relay_disputes").select("*")
         if receipt_id is not None:
             query = query.eq("receipt_id", receipt_id)
         if status is not None:
@@ -819,7 +858,7 @@ class SupabaseStore:
         state_hash: str,
         status: str = "complete",
     ) -> None:
-        self.client.table("relay_agent_state").upsert(
+        self._db().table("relay_agent_state").upsert(
             {
                 "session_id": session_id,
                 "step_number": step_number,
@@ -833,7 +872,7 @@ class SupabaseStore:
     def get_agent_state(
         self, session_id: str, step_number: int | None = None, include_partial: bool = False
     ) -> dict[str, Any] | None:
-        query = self.client.table("relay_agent_state").select("*").eq("session_id", session_id)
+        query = self._db().table("relay_agent_state").select("*").eq("session_id", session_id)
         if step_number is not None:
             query = query.eq("step_number", step_number)
         if not include_partial:
@@ -843,7 +882,7 @@ class SupabaseStore:
 
     def list_agent_states(self, session_id: str) -> list[dict[str, Any]]:
         data = (
-            self.client.table("relay_agent_state")
+            self._db().table("relay_agent_state")
             .select("*")
             .eq("session_id", session_id)
             .order("step_number")
@@ -853,7 +892,7 @@ class SupabaseStore:
         return list(data or [])
 
     def delete_partial_agent_state(self, session_id: str) -> None:
-        self.client.table("relay_agent_state").delete().eq("session_id", session_id).eq(
+        self._db().table("relay_agent_state").delete().eq("session_id", session_id).eq(
             "status", "partial"
         ).execute()
 
@@ -868,7 +907,7 @@ class SupabaseStore:
             "relay_registry_requests",
             "relay_sessions",
         ):
-            self.client.table(table).delete().eq("session_id", session_id).execute()
+            self._db().table(table).delete().eq("session_id", session_id).execute()
 
 
 TABLES = (
@@ -950,9 +989,11 @@ class MemoryStore:
         current_machine: str,
         inference_node: str,
         final_report: str | None = None,
+        owner_node_id: str = "",
     ) -> None:
         record = {
             "session_id": session_id,
+            "owner_node_id": owner_node_id,
             "worker_id": worker_id,
             "task_goal": task_goal,
             "steps_total": steps_total,
