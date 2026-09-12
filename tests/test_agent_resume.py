@@ -267,32 +267,58 @@ def test_parallel_waves_commit_in_step_order(store, market, spawn_worker, tmp_pa
     assert [c["step_number"] for c in store.get_checkpoints("order")] == [1, 2, 3, 4]
 
 
-def test_a_job_started_before_agent_state_still_resumes(store, market, spawn_worker, tmp_path):
-    """Checkpoints outlive the state row. A session with one and not the other
-    should recover its answers, even if the verbatim transcript is gone."""
-    market(store, name="p1", price_out=0.01, latency_ms=500, context_window=100_000)
-    task = dependent_task(tmp_path, steps=7)
+def test_a_session_with_no_agent_state_rebuilds_its_conversation(
+    store, market, spawn_worker, tmp_path
+):
+    """Checkpoints outlive the state row — a session that predates agent state,
+    or one killed in the window between committing a checkpoint and saving the
+    state that records it.
 
-    worker = spawn_worker(
-        store=store, registry_url="", session_id="legacy", task_path=task, worker_id="w"
+    Recovering the answers alone is not enough: later steps would run against an
+    empty history and quietly produce different work than the run would have
+    produced uninterrupted. Each checkpoint stores the instruction it was given
+    alongside the answer, which is exactly the pair the conversation appends, so
+    the transcript can be rebuilt.
+    """
+    market(store, name="p1", price_out=0.01, context_window=100_000)
+    task = dependent_task(tmp_path, steps=5)
+
+    clean = spawn_worker(
+        store=store, registry_url="", session_id="whole2", task_path=task, worker_id="w"
     )
-    assert worker.wait_for_checkpoints(2)
-    worker.proc.send_signal(signal.SIGKILL)
-    worker.proc.wait(timeout=30)
+    assert clean.proc.wait(timeout=180) == 0, clean.proc.stdout.read()
+    expected_answers = [c["solution"] for c in store.get_checkpoints("whole2")]
+    expected_state = state_for(store, "whole2")
 
-    # Wipe the agent state, keeping the checkpoints — the pre-Phase-6 shape.
+    partial_run = spawn_worker(
+        store=store, registry_url="", session_id="lost", task_path=task, worker_id="w"
+    )
+    assert partial_run.wait_for_checkpoints(2)
+    partial_run.proc.send_signal(signal.SIGKILL)
+    partial_run.proc.wait(timeout=30)
+
+    # Reproduce the window deterministically: every agent-state row gone, the
+    # checkpoints that were committed still there.
     snapshot = store.snapshot()
-    snapshot["agent_state"] = []
+    snapshot["agent_state"] = [r for r in snapshot["agent_state"] if r["session_id"] != "lost"]
     store._begin()
     store.tables = snapshot
     store._commit()
-    assert store.get_agent_state("legacy") is None
+    assert store.get_agent_state("lost") is None
+    committed = len(store.get_checkpoints("lost"))
+    assert 0 < committed < 5
 
     resumed = spawn_worker(
-        store=store, registry_url="", session_id="legacy", task_path=task, worker_id="w"
+        store=store, registry_url="", session_id="lost", task_path=task, worker_id="w"
     )
     assert resumed.proc.wait(timeout=180) == 0, resumed.proc.stdout.read()
-    assert [c["step_number"] for c in store.get_checkpoints("legacy")] == [1, 2, 3, 4, 5, 6, 7]
+
+    # The steps that ran after the loss saw the same history they would have.
+    assert [c["solution"] for c in store.get_checkpoints("lost")] == expected_answers
+    recovered = state_for(store, "lost")
+    assert [m.to_dict() for m in recovered.messages] == [
+        m.to_dict() for m in expected_state.messages
+    ]
 
 
 def test_receipts_still_line_up_with_the_steps(store, market, spawn_worker, tmp_path):

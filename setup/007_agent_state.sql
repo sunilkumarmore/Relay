@@ -26,6 +26,12 @@ CREATE INDEX IF NOT EXISTS idx_relay_agent_state_session
 -- checkpoint records which step of the task it was, not just its number.
 ALTER TABLE relay_checkpoints ADD COLUMN IF NOT EXISTS topic TEXT DEFAULT '';
 
+-- The instruction this step was given, with its {{ steps.N.* }} references
+-- resolved. Together with `solution` it is the pair the conversation appends,
+-- so a session whose agent-state rows are lost can have its transcript rebuilt
+-- from checkpoints rather than resuming against an empty history.
+ALTER TABLE relay_checkpoints ADD COLUMN IF NOT EXISTS instruction TEXT DEFAULT '';
+
 -- `problem` now holds the full prompt that was sent, not the step template.
 -- Dispute adjudication re-hashes and re-counts this text, so it has to be what
 -- the provider actually received.

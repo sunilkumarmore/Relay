@@ -172,19 +172,26 @@ def rehydrate(store: Store, session_id: str, goal: str) -> tuple[AgentState, boo
         # turns were never recorded — the ones that must be redone.
         return state, True
 
-    # No state at all: a session that predates agent state, or whose rows were
-    # lost. Recover the answers from the checkpoints so later steps can still
-    # reference them. The verbatim transcript is gone, which is a degradation
-    # rather than a failure.
+    # No state row: either a session that predates agent state, or one whose
+    # process died in the window between committing a checkpoint and saving the
+    # state that records it. Rebuild the conversation from the checkpoints —
+    # each stores the instruction it was given and the answer it produced, which
+    # is exactly the pair commit_step appends. Recovering the answers alone
+    # would leave later steps running against an empty history and quietly
+    # producing different work than the run would have produced uninterrupted.
     for checkpoint in store.get_checkpoints(session_id):
         number = int(checkpoint["step_number"])
         if number in state.step_outputs:
             continue
+        instruction = str(checkpoint.get("instruction") or "")
+        solution = str(checkpoint.get("solution", ""))
+        state.add_message(agent_state_mod.ROLE_USER, instruction, number)
+        state.add_message(agent_state_mod.ROLE_ASSISTANT, solution, number)
         state.record_step(
             StepOutput(
                 step_number=number,
                 topic=str(checkpoint.get("topic") or f"Step {number}"),
-                solution=str(checkpoint.get("solution", "")),
+                solution=solution,
                 reasoning=str(checkpoint.get("reasoning", "")),
                 tokens_in=int(checkpoint.get("tokens_in") or 0),
                 tokens_out=int(checkpoint.get("tokens_out") or 0),
@@ -459,6 +466,9 @@ def run_worker(
             tokens_in=run.tokens_in,
             tokens_out=run.tokens_out,
             topic=run.output.topic,
+            # The resolved instruction, so the conversation can be rebuilt from
+            # checkpoints alone if the state row is ever lost.
+            instruction=run.instruction,
         )
         save_state(store, cfg.session_id, agent.state, run.output.step_number, "complete")
         solved_steps.add(run.output.step_number)

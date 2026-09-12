@@ -113,6 +113,7 @@ class Store(Protocol):
         tokens_in: int = 0,
         tokens_out: int = 0,
         topic: str = "",
+        instruction: str = "",
     ) -> bool:
         """Insert one step. Returns False when the step already exists.
 
@@ -433,6 +434,7 @@ class SupabaseStore:
         tokens_in: int = 0,
         tokens_out: int = 0,
         topic: str = "",
+        instruction: str = "",
     ) -> bool:
         # Lean on the DB unique constraint on (session_id, step_number) so this is
         # atomic — two workers racing on the same step cannot both succeed.
@@ -453,6 +455,7 @@ class SupabaseStore:
                     "tokens_in": tokens_in,
                     "tokens_out": tokens_out,
                     "topic": topic,
+                    "instruction": instruction,
                 },
                 on_conflict="session_id,step_number",
                 ignore_duplicates=True,
@@ -1048,6 +1051,7 @@ class MemoryStore:
         tokens_in: int = 0,
         tokens_out: int = 0,
         topic: str = "",
+        instruction: str = "",
     ) -> bool:
         with self._txn():
             # Stands in for UNIQUE(session_id, step_number).
@@ -1069,6 +1073,7 @@ class MemoryStore:
                     "tokens_in": tokens_in,
                     "tokens_out": tokens_out,
                     "topic": topic,
+                    "instruction": instruction,
                     "completed_at": now_iso(),
                 }
             )
