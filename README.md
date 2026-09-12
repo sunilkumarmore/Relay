@@ -1,20 +1,43 @@
 # Relay
 
-Relay is a two-tier distributed AI agent system.
+Relay is a peer-to-peer marketplace for AI compute.
 
-- **Inference nodes** run the LLM and serve many workers.
-- **Worker nodes** run agent logic and call inference nodes.
-- **Supabase** stores checkpoints and migration state outside both machines.
-- Workers can be evicted and resumed without losing progress.
+**Providers** sell inference. **Consumers** buy it to run agents. Settlement runs
+on signed receipts, and a job survives losing either the machine running it or
+the provider serving it.
 
-## What is Relay
+The load-bearing idea is that an agent's progress lives outside the process
+running it. That is what makes the process disposable — and a disposable process
+is a rentable one. If you cannot evict a tenant safely, you cannot rent to them.
 
-Relay demonstrates an architecture for a peer-to-peer AI compute marketplace:
+## How it fits together
 
-- Inference tier: shared LLM service (`relay/inference/registry.py` + Ollama)
-- Worker tier: distributed agent workers (`relay/worker/daemon.py`)
-- External state tier: Supabase (`relay_*` tables)
-- Observability tier: terminal dashboard (`relay/dashboard/tui.py`)
+| Tier | What it does | Where |
+|---|---|---|
+| Provider | Serves inference, publishes signed offers, issues receipts | `relay/provider/` |
+| Consumer | Picks a provider, runs the agent, checks and pays the bill | `relay/consumer/`, `relay/worker/` |
+| Directory & ledger | Offers, receipts, credits, reputation | Supabase, behind `relay/store.py` |
+| Observability | Live terminal dashboard | `relay/dashboard/tui.py` |
+
+What holds it together:
+
+- **Identity** (`relay/identity.py`) — every node is an Ed25519 keypair; the
+  public key *is* the node id. `WORKER_ID` is a label and authorizes nothing.
+- **Signed requests** (`relay/auth.py`) — every call carries a signature over
+  the method, path, timestamp and body hash.
+- **Offers** (`relay/provider/offers.py`) — signed, expiring statements of
+  model, context window, price and capacity.
+- **Receipts** (`relay/receipts.py`) — the provider signs what it did; the
+  consumer checks it against the offer and its own token count, then
+  countersigns. An unchecked receipt is never paid.
+- **Ledger** (`relay/ledger.py`) — double entry. Every transaction sums to
+  zero, in the application and in a Postgres trigger.
+- **Reputation** (`relay/reputation.py`) — a deterministic function of public
+  rows. Recompute it yourself and compare.
+
+Two ways to run it: **pinned**, where a worker is pointed at one provider (the
+two-machine demo below), or **market**, where it discovers providers, picks by
+policy, and fails over.
 
 ## Prerequisites
 
@@ -208,6 +231,78 @@ python -m relay.controller report --session <id>     # print final report
 4. Dashboard shows real-time request and migration telemetry.
 5. Machine + inference node audit trail is persisted per step.
 
+## Running as a market
+
+The demo above pins a worker to one provider. To run the actual marketplace,
+drop `INFERENCE_REGISTRY` and give each side its own configuration.
+
+**As a provider.** Copy `relay-provider.example.yaml` to `relay-provider.yaml`,
+set your endpoint and your prices, then:
+
+```bash
+python -m relay.controller wallet deposit --amount 100 --dev   # needs RELAY_DEV_MODE=1
+python -m relay.controller wallet stake --amount 10            # credits at risk
+python -m relay.provider                                       # publishes your offers
+python -m relay.controller earnings
+```
+
+A provider refuses to start if it advertises a model its backend does not
+actually serve, and stops advertising if its stake falls below the floor.
+
+**As a consumer.** State what the job needs in the task file:
+
+```yaml
+goal: "Review our Q3 roadmap"
+
+requirements:
+  model: llama3
+  max_price_out_per_1k: 0.20
+  min_context_window: 8192
+  budget_credits: 5.0
+
+steps:
+  - topic: "Risk analysis"
+    prompt: "List the top 3 risks for shipping Feature A."
+```
+
+Then run it with no endpoint configured — the worker shops the directory:
+
+```bash
+python -m relay.controller wallet deposit --amount 100 --dev
+TASK_FILE=tasks/my-task.yaml python -m relay.worker
+python -m relay.controller receipts --session <id>
+```
+
+The worker holds its budget before starting, settles each step against a
+countersigned receipt, and releases whatever it did not spend. If the provider
+it chose disappears, it picks another and retries the step — no step is
+duplicated or skipped.
+
+**Keeping the market honest:**
+
+```bash
+python -m relay.controller reputation recompute      # anyone can run this
+python -m relay.controller reputation show <node>    # and check the working
+python -m relay.controller disputes ls
+python -m relay.controller disputes adjudicate
+python -m relay.controller wallet verify             # the ledger sums to zero
+```
+
+Selection policies are `cheapest` (default), `fastest`, `round_robin` and
+`pinned` — set with `RELAY_POLICY`. See `.env.example` for the rest, and
+`docs/MARKETPLACE_PLAN.md` for what is built and what is not.
+
+### What is deliberately not built
+
+- **No payment rail.** Credits are internal; the ledger's `deposit` entry is
+  where real money would attach.
+- **No decentralized directory.** Supabase is the coordination layer, behind
+  one interface so it can be swapped.
+- **No human arbitration.** Only hash mismatches and token over-claims are
+  adjudicated; subjective quality disputes are recorded and surfaced.
+- **Stateful agents are Phase 6.** Steps still run independently — each is its
+  own prompt, with no context carried between them.
+
 ## Development
 
 Install with the dev extras and run the checks:
@@ -264,10 +359,24 @@ Make sure Ollama is running with `OLLAMA_HOST=0.0.0.0`.
 relay/
 ├── relay/
 │   ├── config.py           # env loading
+│   ├── identity.py         # Ed25519 node identity
+│   ├── auth.py             # signed requests
 │   ├── store.py            # Store protocol + Supabase / Memory / File
+│   ├── receipts.py         # signed, checkable bills
+│   ├── ledger.py           # double-entry credits
+│   ├── reputation.py       # deterministic scores
+│   ├── tokens.py           # independent token counting
+│   ├── disputes.py         # adjudication and stake
 │   ├── inference/
-│   │   ├── backends.py     # InferenceBackend protocol + Ollama / Fake
-│   │   └── registry.py     # the HTTP front door
+│   │   ├── backends.py     # InferenceBackend protocol + Ollama / OpenAI / Fake
+│   │   └── registry.py     # compatibility shim over relay/provider
+│   ├── provider/
+│   │   ├── server.py       # the provider: serves, advertises, bills
+│   │   ├── offers.py       # signed, expiring terms
+│   │   └── config.py       # relay-provider.yaml
+│   ├── consumer/
+│   │   ├── market.py       # discovery and selection policies
+│   │   └── session.py      # binding, failover, paying
 │   ├── worker/
 │   │   ├── daemon.py       # the agent loop
 │   │   ├── tasks.py        # task YAML loading
@@ -276,7 +385,7 @@ relay/
 │   └── dashboard/tui.py
 ├── tests/                  # runs with no network
 ├── tasks/example.yaml
-├── setup/supabase_setup.sql
+├── setup/                  # schema + migrations 002-006
 ├── docs/MARKETPLACE_PLAN.md
 ├── output/
 ├── .env.example

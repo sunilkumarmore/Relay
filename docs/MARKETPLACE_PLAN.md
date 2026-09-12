@@ -4,6 +4,27 @@ Relay today proves one primitive: an agent's progress lives outside the process 
 process is disposable. This plan turns that primitive into a working peer-to-peer AI compute
 marketplace. Each phase below is a **prompt to paste into a fresh Claude Code session on this repo**.
 
+## Status
+
+Phases 0-5 are **built and merged**. Phase 6 (stateful agent checkpointing),
+Phase 7 (CLI and web surfaces) and Phase 8 (hardening) are still prompts.
+
+| Phase | State | What landed |
+|---|---|---|
+| 0 Foundation | done | `relay/` package, Store + InferenceBackend seams, CI, kill -9 eviction test |
+| 1 Identity | done | Ed25519 nodes, signed requests, durable registry, RLS |
+| 2 Offers | done | Signed expiring offers, multi-model providers, 429 back-pressure |
+| 3 Discovery | done | Directory, selection policies, mid-job failover |
+| 4 Ledger | done | Signed receipts, token bound, double-entry credits |
+| 5 Reputation | done | Deterministic scores, adjudicated disputes, stake and slashing |
+| 6 Stateful agent | **next** | Context between steps, full agent state checkpointed |
+| 7 Surfaces | pending | `relay` CLI, web market dashboard, docker compose |
+| 8 Hardening | pending | TLS, rate limits, metrics, chaos runs |
+
+Phase 6 is the one that matters most for the pitch: steps still run
+independently, so what exists is a resumable *queue*, not yet a resumable
+*agent*.
+
 ## How to use this document
 
 1. Start a new Claude Code session on the Relay repo.
