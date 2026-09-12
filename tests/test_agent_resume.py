@@ -348,15 +348,14 @@ def test_receipts_still_line_up_with_the_steps(store, market, spawn_worker, tmp_
     ledger.check_invariant()
 
 
-def test_a_checkpoint_with_no_conversation_behind_it_is_redone(
-    store, market, spawn_worker, tmp_path
-):
+def test_a_checkpoint_ahead_of_the_state_is_folded_back_in(store, market, spawn_worker, tmp_path):
     """The crash window between writing a checkpoint and saving the state.
 
-    Skipping that step on the strength of the checkpoint alone would leave its
+    Skipping the step on the strength of the checkpoint alone would leave its
     turns missing from the transcript for the rest of the run — a hole nothing
-    later could fill. Redoing it is free, because committing a step is
-    idempotent.
+    later could fill. Redoing it would work but costs a real inference call. The
+    checkpoint stores the instruction it was given, so the turns are rebuilt
+    from it instead: correct history, nothing paid twice.
     """
     market(store, name="p1", price_out=0.01, context_window=100_000)
     task = dependent_task(tmp_path, steps=4)
@@ -399,5 +398,66 @@ def test_a_checkpoint_with_no_conversation_behind_it_is_redone(
     recovered = state_for(store, "torn")
     assert [m.to_dict() for m in recovered.messages] == [m.to_dict() for m in expected.messages]
     assert recovered.state_hash() == expected.state_hash()
-    # And the step was not billed a second time.
     assert len(store.get_checkpoints("torn")) == 4
+
+
+def test_a_resume_pays_only_for_what_is_outstanding(store, market, spawn_worker, tmp_path):
+    """Rebuilding a missing turn from its checkpoint must not cost a call.
+
+    Redoing the step would also be correct, but in a market a redundant
+    inference call is money.
+    """
+    provider = market(store, name="p1", price_out=0.01, latency_ms=400, context_window=100_000)
+    task = dependent_task(tmp_path, steps=6)
+
+    worker = spawn_worker(
+        store=store, registry_url="", session_id="thrifty", task_path=task, worker_id="w"
+    )
+    assert worker.wait_for_checkpoints(2)
+    worker.proc.send_signal(signal.SIGKILL)
+    worker.proc.wait(timeout=30)
+
+    done = len(store.get_checkpoints("thrifty"))
+    calls_before = provider.backend.calls
+
+    resumed = spawn_worker(
+        store=store, registry_url="", session_id="thrifty", task_path=task, worker_id="w"
+    )
+    assert resumed.proc.wait(timeout=180) == 0, resumed.proc.stdout.read()
+
+    assert provider.backend.calls - calls_before == 6 - done
+    assert [c["step_number"] for c in store.get_checkpoints("thrifty")] == [1, 2, 3, 4, 5, 6]
+
+
+def test_a_resume_pays_nothing_when_the_state_row_is_behind(store, market, spawn_worker, tmp_path):
+    """The exact crash window, priced."""
+    provider = market(store, name="p1", price_out=0.01, context_window=100_000)
+    task = dependent_task(tmp_path, steps=4)
+
+    worker = spawn_worker(
+        store=store, registry_url="", session_id="behind", task_path=task, worker_id="w"
+    )
+    assert worker.proc.wait(timeout=180) == 0
+
+    # Drop the last state row, keeping its checkpoint: state at 3, checkpoints to 4.
+    snapshot = store.snapshot()
+    snapshot["agent_state"] = [
+        r
+        for r in snapshot["agent_state"]
+        if not (r["session_id"] == "behind" and int(r["step_number"]) == 4)
+    ]
+    snapshot["sessions"] = [
+        {**r, "status": "in_progress"} if r["session_id"] == "behind" else r
+        for r in snapshot["sessions"]
+    ]
+    store._begin()
+    store.tables = snapshot
+    store._commit()
+
+    calls_before = provider.backend.calls
+    resumed = spawn_worker(
+        store=store, registry_url="", session_id="behind", task_path=task, worker_id="w"
+    )
+    assert resumed.proc.wait(timeout=180) == 0, resumed.proc.stdout.read()
+
+    assert provider.backend.calls == calls_before, "step 4 was recomputed, not rebuilt"

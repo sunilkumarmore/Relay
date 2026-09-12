@@ -150,42 +150,39 @@ def render_banner(title: str, lines: list[str]) -> None:
 DEFAULT_CONTEXT_WINDOW = 8192
 
 
-def rehydrate(store: Store, session_id: str, goal: str) -> tuple[AgentState, bool]:
+def rehydrate(store: Store, session_id: str, goal: str) -> AgentState:
     """Restore the agent, or start one.
 
-    A partial row is never rehydrated — it was written mid-step by an eviction,
-    so the step it belongs to is redone. That is safe because
-    UNIQUE(session_id, step_number) makes committing a step idempotent, and it
-    is preferable to resuming into a conversation that was only half recorded.
+    Two sources, and they can disagree. The saved state is the conversation as
+    the agent had it; the checkpoints are the steps that were committed. A
+    process dying between committing a step and saving the state that records it
+    leaves the second ahead of the first.
+
+    Each checkpoint stores the instruction it was given alongside the answer —
+    the same pair the conversation appends — so a step the state does not know
+    about is folded back in rather than redone. Recovering only the answers
+    would leave later steps running against a history they never had, quietly
+    producing different work while still looking like a clean resume.
+
+    A partial row is never rehydrated: it was written mid-step by an eviction,
+    so the step it belongs to is redone, which is safe because
+    UNIQUE(session_id, step_number) makes committing a step idempotent.
     """
     row = store.get_agent_state(session_id)
-    found = row is not None
     if row is not None:
         state = agent_state_mod.verify(str(row["state_blob"]), str(row.get("state_hash", "")))
         state.goal = state.goal or goal
     else:
         state = AgentState(goal=goal)
 
-    if found:
-        # A saved conversation is authoritative about what this agent has done.
-        # Topping it up from checkpoints would re-adopt exactly the steps whose
-        # turns were never recorded — the ones that must be redone.
-        return state, True
-
-    # No state row: either a session that predates agent state, or one whose
-    # process died in the window between committing a checkpoint and saving the
-    # state that records it. Rebuild the conversation from the checkpoints —
-    # each stores the instruction it was given and the answer it produced, which
-    # is exactly the pair commit_step appends. Recovering the answers alone
-    # would leave later steps running against an empty history and quietly
-    # producing different work than the run would have produced uninterrupted.
-    for checkpoint in store.get_checkpoints(session_id):
+    for checkpoint in sorted(
+        store.get_checkpoints(session_id), key=lambda c: int(c["step_number"])
+    ):
         number = int(checkpoint["step_number"])
         if number in state.step_outputs:
             continue
-        instruction = str(checkpoint.get("instruction") or "")
         solution = str(checkpoint.get("solution", ""))
-        state.add_message(agent_state_mod.ROLE_USER, instruction, number)
+        state.add_message(agent_state_mod.ROLE_USER, str(checkpoint.get("instruction") or ""), number)
         state.add_message(agent_state_mod.ROLE_ASSISTANT, solution, number)
         state.record_step(
             StepOutput(
@@ -197,7 +194,7 @@ def rehydrate(store: Store, session_id: str, goal: str) -> tuple[AgentState, boo
                 tokens_out=int(checkpoint.get("tokens_out") or 0),
             )
         )
-    return state, False
+    return state
 
 
 def save_state(store: Store, session_id: str, state: AgentState, step_number: int, status: str) -> None:
@@ -403,14 +400,10 @@ def run_worker(
     next_step = steps_completed + 1
     runtime.next_problem = get_problem(problems, next_step).prompt if next_step <= steps_total else ""
 
-    agent_state, had_state = rehydrate(store, cfg.session_id, task.goal)
-    if had_state:
-        # The conversation is what says which steps this agent has taken.
-        # A checkpoint written in the instant before the process died has no
-        # turns behind it, and skipping that step on the strength of the
-        # checkpoint alone would leave a permanent hole in the transcript.
-        # Redoing it is free: committing a step is idempotent.
-        solved_steps = set(agent_state.step_outputs)
+    agent_state = rehydrate(store, cfg.session_id, task.goal)
+    # The rehydrated conversation covers every committed step, so it is the
+    # single answer to what this agent has already done.
+    solved_steps = set(agent_state.step_outputs)
     # A partial row was written mid-step by an eviction. That step is redone, so
     # the half-recorded state it describes is discarded rather than resumed into.
     store.delete_partial_agent_state(cfg.session_id)
@@ -473,9 +466,8 @@ def run_worker(
         save_state(store, cfg.session_id, agent.state, run.output.step_number, "complete")
         solved_steps.add(run.output.step_number)
         if not inserted:
-            # Someone already recorded this step — this run, before it died, or
-            # another worker. The billing row stands as it was; our conversation
-            # is now caught up with it.
+            # Another worker got there first. The billing row stands as it was;
+            # our conversation is now caught up with it.
             return False
 
         next_step_num = run.output.step_number + 1
@@ -595,6 +587,18 @@ def run_worker(
                 if len(solved_steps) < steps_total and step_sleep > 0:
                     print(f"Sleeping {step_sleep} seconds...")
                     time.sleep(step_sleep)
+
+        # Save the finished conversation even when this run had nothing left to
+        # do. A resume that only folded earlier steps back in would otherwise
+        # leave the stored state behind the checkpoints it just reconciled.
+        if agent.state.step_outputs:
+            save_state(
+                store,
+                cfg.session_id,
+                agent.state,
+                max(agent.state.step_outputs),
+                "complete",
+            )
 
         report = build_report(store, cfg.session_id)
         report_path = out_dir / f"final_report_{cfg.worker_id}_{cfg.session_id}.txt"
