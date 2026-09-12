@@ -20,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -108,6 +109,8 @@ class Store(Protocol):
         inference_node: str,
         inference_latency_ms: int,
         tokens_used: int,
+        tokens_in: int = 0,
+        tokens_out: int = 0,
     ) -> bool:
         """Insert one step. Returns False when the step already exists.
 
@@ -126,6 +129,8 @@ class Store(Protocol):
         latency_ms: int,
         tokens_used: int,
         success: bool,
+        tokens_in: int = 0,
+        tokens_out: int = 0,
     ) -> None: ...
 
     def insert_migration_event(
@@ -171,6 +176,27 @@ class Store(Protocol):
 
     def list_registry_requests(
         self, inference_node: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]: ...
+
+    # -- directory (offers and provider events) ---------------------------
+    def upsert_offer(self, offer: dict[str, Any]) -> None: ...
+
+    def list_offers(self, model: str | None = None) -> list[dict[str, Any]]: ...
+
+    def delete_offer(self, offer_id: str) -> None: ...
+
+    def delete_offers_for(self, provider_node_id: str) -> None: ...
+
+    def insert_provider_event(
+        self,
+        provider_node_id: str,
+        kind: str,
+        model: str = "",
+        detail: dict[str, Any] | None = None,
+    ) -> None: ...
+
+    def list_provider_events(
+        self, provider_node_id: str | None = None, kind: str | None = None, limit: int = 100
     ) -> list[dict[str, Any]]: ...
 
     def reset_session(self, session_id: str) -> None: ...
@@ -314,6 +340,8 @@ class SupabaseStore:
         inference_node: str,
         inference_latency_ms: int,
         tokens_used: int,
+        tokens_in: int = 0,
+        tokens_out: int = 0,
     ) -> bool:
         # Lean on the DB unique constraint on (session_id, step_number) so this is
         # atomic — two workers racing on the same step cannot both succeed.
@@ -331,6 +359,8 @@ class SupabaseStore:
                     "inference_node": inference_node,
                     "inference_latency_ms": inference_latency_ms,
                     "tokens_used": tokens_used,
+                    "tokens_in": tokens_in,
+                    "tokens_out": tokens_out,
                 },
                 on_conflict="session_id,step_number",
                 ignore_duplicates=True,
@@ -347,6 +377,8 @@ class SupabaseStore:
         latency_ms: int,
         tokens_used: int,
         success: bool,
+        tokens_in: int = 0,
+        tokens_out: int = 0,
     ) -> None:
         self.client.table("relay_inference_log").insert(
             {
@@ -355,6 +387,8 @@ class SupabaseStore:
                 "inference_node": inference_node,
                 "latency_ms": latency_ms,
                 "tokens_used": tokens_used,
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
                 "success": success,
             }
         ).execute()
@@ -463,6 +497,50 @@ class SupabaseStore:
         data = query.order("requested_at", desc=True).limit(limit).execute().data
         return list(reversed(list(data or [])))
 
+    def upsert_offer(self, offer: dict[str, Any]) -> None:
+        self.client.table("relay_offers").upsert(offer, on_conflict="offer_id").execute()
+
+    def list_offers(self, model: str | None = None) -> list[dict[str, Any]]:
+        query = self.client.table("relay_offers").select("*")
+        if model is not None:
+            query = query.eq("model", model)
+        return list(query.execute().data or [])
+
+    def delete_offer(self, offer_id: str) -> None:
+        self.client.table("relay_offers").delete().eq("offer_id", offer_id).execute()
+
+    def delete_offers_for(self, provider_node_id: str) -> None:
+        self.client.table("relay_offers").delete().eq(
+            "provider_node_id", provider_node_id
+        ).execute()
+
+    def insert_provider_event(
+        self,
+        provider_node_id: str,
+        kind: str,
+        model: str = "",
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        self.client.table("relay_provider_events").insert(
+            {
+                "provider_node_id": provider_node_id,
+                "kind": kind,
+                "model": model,
+                "detail": detail or {},
+            }
+        ).execute()
+
+    def list_provider_events(
+        self, provider_node_id: str | None = None, kind: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        query = self.client.table("relay_provider_events").select("*")
+        if provider_node_id is not None:
+            query = query.eq("provider_node_id", provider_node_id)
+        if kind is not None:
+            query = query.eq("kind", kind)
+        data = query.order("occurred_at", desc=True).limit(limit).execute().data
+        return list(reversed(list(data or [])))
+
     def reset_session(self, session_id: str) -> None:
         for table in (
             "relay_worker_state",
@@ -484,6 +562,8 @@ TABLES = (
     "migration_log",
     "nodes",
     "registry_requests",
+    "offers",
+    "provider_events",
 )
 
 
@@ -496,11 +576,13 @@ class MemoryStore:
 
     def __init__(self) -> None:
         self.tables = _empty_tables()
+        self._lock = threading.RLock()
 
     # Hooks that FileStore overrides to persist between mutations.
-    def _refresh(self) -> None:
-        """Pull in writes made by other processes. No-op in memory."""
-        return None
+    def _view(self) -> dict[str, list[dict[str, Any]]]:
+        """Tables to read from. FileStore returns a fresh private copy, so a
+        reader never disturbs the dict a concurrent writer is mutating."""
+        return self.tables
 
     def _begin(self) -> None:
         return None
@@ -510,22 +592,24 @@ class MemoryStore:
 
     @contextlib.contextmanager
     def _txn(self):
-        self._begin()
-        try:
-            yield
-        finally:
-            self._commit()
+        # Serializes writers inside this process. FileStore adds a file lock on
+        # top for writers in other processes.
+        with self._lock:
+            self._begin()
+            try:
+                yield
+            finally:
+                self._commit()
 
     def snapshot(self) -> dict[str, list[dict[str, Any]]]:
-        self._refresh()
-        return json.loads(json.dumps(self.tables))
+        return json.loads(json.dumps(self._view()))
 
     def verify_connection(self) -> None:
         return None
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:
-        self._refresh()
-        for row in self.tables["sessions"]:
+        tables = self._view()
+        for row in tables["sessions"]:
             if row["session_id"] == session_id:
                 return dict(row)
         return None
@@ -571,16 +655,16 @@ class MemoryStore:
                     return
 
     def list_sessions(self) -> list[dict[str, Any]]:
-        self._refresh()
+        tables = self._view()
         return sorted(
-            (dict(r) for r in self.tables["sessions"]),
+            (dict(r) for r in tables["sessions"]),
             key=lambda r: str(r.get("updated_at", "")),
             reverse=True,
         )
 
     def get_state(self, session_id: str) -> dict[str, Any] | None:
-        self._refresh()
-        for row in self.tables["worker_state"]:
+        tables = self._view()
+        for row in tables["worker_state"]:
             if row["session_id"] == session_id:
                 return dict(row)
         return None
@@ -613,16 +697,16 @@ class MemoryStore:
             self.tables["worker_state"].append(record)
 
     def list_worker_state(self) -> list[dict[str, Any]]:
-        self._refresh()
+        tables = self._view()
         return sorted(
-            (dict(r) for r in self.tables["worker_state"]),
+            (dict(r) for r in tables["worker_state"]),
             key=lambda r: str(r.get("updated_at", "")),
             reverse=True,
         )
 
     def get_checkpoints(self, session_id: str) -> list[dict[str, Any]]:
-        self._refresh()
-        rows = [dict(r) for r in self.tables["checkpoints"] if r["session_id"] == session_id]
+        tables = self._view()
+        rows = [dict(r) for r in tables["checkpoints"] if r["session_id"] == session_id]
         return sorted(rows, key=lambda r: int(r["step_number"]))
 
     def insert_checkpoint(
@@ -637,6 +721,8 @@ class MemoryStore:
         inference_node: str,
         inference_latency_ms: int,
         tokens_used: int,
+        tokens_in: int = 0,
+        tokens_out: int = 0,
     ) -> bool:
         with self._txn():
             # Stands in for UNIQUE(session_id, step_number).
@@ -655,6 +741,8 @@ class MemoryStore:
                     "inference_node": inference_node,
                     "inference_latency_ms": inference_latency_ms,
                     "tokens_used": tokens_used,
+                    "tokens_in": tokens_in,
+                    "tokens_out": tokens_out,
                     "completed_at": now_iso(),
                 }
             )
@@ -668,6 +756,8 @@ class MemoryStore:
         latency_ms: int,
         tokens_used: int,
         success: bool,
+        tokens_in: int = 0,
+        tokens_out: int = 0,
     ) -> None:
         with self._txn():
             self.tables["inference_log"].append(
@@ -677,6 +767,8 @@ class MemoryStore:
                     "inference_node": inference_node,
                     "latency_ms": latency_ms,
                     "tokens_used": tokens_used,
+                    "tokens_in": tokens_in,
+                    "tokens_out": tokens_out,
                     "success": success,
                     "requested_at": now_iso(),
                 }
@@ -705,9 +797,9 @@ class MemoryStore:
             )
 
     def list_migration_events(self, limit: int = 20) -> list[dict[str, Any]]:
-        self._refresh()
+        tables = self._view()
         rows = sorted(
-            (dict(r) for r in self.tables["migration_log"]),
+            (dict(r) for r in tables["migration_log"]),
             key=lambda r: str(r.get("occurred_at", "")),
             reverse=True,
         )
@@ -744,17 +836,17 @@ class MemoryStore:
             self.tables["nodes"].append(record)
 
     def get_node(self, worker_id: str) -> dict[str, Any] | None:
-        self._refresh()
-        for row in self.tables["nodes"]:
+        tables = self._view()
+        for row in tables["nodes"]:
             if row["worker_id"] == worker_id:
                 return dict(row)
         return None
 
     def list_nodes(self, inference_node: str | None = None) -> list[dict[str, Any]]:
-        self._refresh()
+        tables = self._view()
         return [
             dict(r)
-            for r in self.tables["nodes"]
+            for r in tables["nodes"]
             if inference_node is None or r.get("inference_node") == inference_node
         ]
 
@@ -787,13 +879,66 @@ class MemoryStore:
     def list_registry_requests(
         self, inference_node: str | None = None, limit: int = 100
     ) -> list[dict[str, Any]]:
-        self._refresh()
+        tables = self._view()
         rows = [
             dict(r)
-            for r in self.tables["registry_requests"]
+            for r in tables["registry_requests"]
             if inference_node is None or r.get("inference_node") == inference_node
         ]
         rows.sort(key=lambda r: str(r.get("requested_at", "")))
+        return rows[-limit:]
+
+    def upsert_offer(self, offer: dict[str, Any]) -> None:
+        with self._txn():
+            for row in self.tables["offers"]:
+                if row["offer_id"] == offer["offer_id"]:
+                    row.update(offer)
+                    return
+            self.tables["offers"].append(dict(offer))
+
+    def list_offers(self, model: str | None = None) -> list[dict[str, Any]]:
+        tables = self._view()
+        return [dict(r) for r in tables["offers"] if model is None or r.get("model") == model]
+
+    def delete_offer(self, offer_id: str) -> None:
+        with self._txn():
+            self.tables["offers"] = [r for r in self.tables["offers"] if r["offer_id"] != offer_id]
+
+    def delete_offers_for(self, provider_node_id: str) -> None:
+        with self._txn():
+            self.tables["offers"] = [
+                r for r in self.tables["offers"] if r.get("provider_node_id") != provider_node_id
+            ]
+
+    def insert_provider_event(
+        self,
+        provider_node_id: str,
+        kind: str,
+        model: str = "",
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        with self._txn():
+            self.tables["provider_events"].append(
+                {
+                    "provider_node_id": provider_node_id,
+                    "kind": kind,
+                    "model": model,
+                    "detail": detail or {},
+                    "occurred_at": now_iso(),
+                }
+            )
+
+    def list_provider_events(
+        self, provider_node_id: str | None = None, kind: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        tables = self._view()
+        rows = [
+            dict(r)
+            for r in tables["provider_events"]
+            if (provider_node_id is None or r.get("provider_node_id") == provider_node_id)
+            and (kind is None or r.get("kind") == kind)
+        ]
+        rows.sort(key=lambda r: str(r.get("occurred_at", "")))
         return rows[-limit:]
 
     def reset_session(self, session_id: str) -> None:
@@ -833,8 +978,9 @@ class FileStore(MemoryStore):
         tmp.write_text(json.dumps(tables, indent=1), encoding="utf-8")
         os.replace(tmp, self.path)
 
-    def _refresh(self) -> None:
-        self.tables = self._read()
+    def _view(self) -> dict[str, list[dict[str, Any]]]:
+        # Writes land via os.replace, so an unlocked read always sees a whole file.
+        return self._read()
 
     def _begin(self) -> None:
         if self._depth == 0 and fcntl is not None:

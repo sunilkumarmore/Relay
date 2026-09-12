@@ -1,0 +1,40 @@
+# Relay provider configuration.
+#
+# This file is your offer to the market: what you serve, on what hardware, at
+# what price, and how much of it at once. Copy it to relay-provider.yaml and
+# edit. The provider validates it on start and refuses to run if it advertises a
+# model its backend does not actually have.
+
+node:
+  # Where consumers reach you. Must be routable from their machines — not
+  # localhost unless you are only serving yourself.
+  endpoint_url: http://192.168.1.10:8765
+  region: home-lab
+  # How long an advertisement stays valid. The provider republishes at half this
+  # interval, so a node that dies drops out of the directory within one TTL.
+  offer_ttl_seconds: 300
+  capabilities:
+    streaming: false
+
+backends:
+  ollama:
+    kind: ollama
+    host: http://localhost:11434
+    timeout: 180
+
+  # Anything speaking the OpenAI API — vLLM, llama.cpp, LM Studio.
+  # vllm:
+  #   kind: openai
+  #   base_url: http://localhost:8000/v1
+  #   api_key_env: VLLM_API_KEY
+
+models:
+  - model: llama3
+    backend: ollama
+    context_window: 8192
+    # Credits per 1000 tokens. Input is cheap to process, output is not.
+    price_in_per_1k: 0.05
+    price_out_per_1k: 0.15
+    # Past this many in-flight requests the provider returns 429 rather than
+    # queueing. An honest refusal beats a slow yes.
+    max_concurrency: 2

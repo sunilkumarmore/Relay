@@ -393,6 +393,8 @@ def run_worker(
             result = call_inference(cfg, runtime, problem.prompt, max_tokens)
             latency_ms = int(result.get("latency_ms") or 0)
             tokens_used = int(result.get("tokens_used") or 0)
+            tokens_in = int(result.get("tokens_in") or 0)
+            tokens_out = int(result.get("tokens_out") or 0)
             solution = str(result.get("response", "")).strip()
             print(f"Inference latency: {latency_ms} ms")
 
@@ -407,6 +409,8 @@ def run_worker(
                 inference_node=runtime.inference_node,
                 inference_latency_ms=latency_ms,
                 tokens_used=tokens_used,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
             )
             if not inserted:
                 # Another worker already committed this step; adopt it and move on.

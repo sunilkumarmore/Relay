@@ -151,3 +151,65 @@ def test_file_store_is_visible_to_a_second_handle(tmp_path):
     assert len(second.get_checkpoints("s1")) == 1
     # And the constraint holds across handles, not just within one.
     assert second.insert_checkpoint(**CHECKPOINT) is False
+
+
+def test_concurrent_writers_in_one_process_do_not_lose_rows(tmp_path):
+    """Reads used to overwrite the table dict a writer was mid-transaction on,
+    silently dropping appends."""
+    import threading
+
+    store = FileStore(tmp_path / "concurrent.json")
+    errors: list[Exception] = []
+
+    def write(n: int) -> None:
+        try:
+            for i in range(20):
+                store.insert_migration_event(
+                    session_id=f"s{n}",
+                    worker_id=f"w{n}",
+                    event="started",
+                    from_machine=None,
+                    to_machine="m",
+                    step_at_event=i,
+                )
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def read() -> None:
+        try:
+            for _ in range(200):
+                store.snapshot()
+                store.get_checkpoints("s0")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=write, args=(n,)) for n in range(4)]
+    threads += [threading.Thread(target=read) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert errors == []
+    assert len(store.snapshot()["migration_log"]) == 80
+
+
+def test_concurrent_writers_across_processes_do_not_lose_rows(tmp_path):
+    import subprocess
+    import sys
+
+    path = tmp_path / "multiproc.json"
+    FileStore(path)
+    script = (
+        "import sys;from relay.store import FileStore;"
+        "s=FileStore(sys.argv[1]);n=sys.argv[2];"
+        "[s.insert_migration_event(session_id=n,worker_id=n,event='started',"
+        "from_machine=None,to_machine='m',step_at_event=i) for i in range(15)]"
+    )
+    procs = [
+        subprocess.Popen([sys.executable, "-c", script, str(path), f"p{n}"]) for n in range(4)
+    ]
+    for proc in procs:
+        assert proc.wait(timeout=60) == 0
+
+    assert len(FileStore(path).snapshot()["migration_log"]) == 60
