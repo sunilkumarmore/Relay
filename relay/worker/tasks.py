@@ -12,6 +12,10 @@ class Problem:
     step_number: int
     topic: str
     prompt: str
+    # Steps this one needs the output of. Referring to {{ steps.N.solution }}
+    # implies a dependency too, so this is only needed for ordering that the
+    # prompt text does not already express.
+    depends_on: tuple[int, ...] = ()
 
 
 @dataclass
@@ -113,6 +117,15 @@ def load_task(path: str) -> Task:
         steps:
           - topic: "Step name"
             prompt: "Full prompt text sent to the LLM"
+
+          - topic: "A step that builds on the first"
+            # Earlier answers can be referenced directly. Doing so also declares
+            # the dependency, so this step will not run before step 1.
+            prompt: "Given {{ steps.1.solution }}, what follows?"
+
+          - topic: "A step that needs two others"
+            depends_on: [1, 2]
+            prompt: "Reconcile the two."
     """
     data: dict[str, Any] = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     goal: str = str(data.get("goal", "Custom task"))
@@ -124,6 +137,7 @@ def load_task(path: str) -> Task:
             step_number=i + 1,
             topic=str(step.get("topic", f"Step {i + 1}")),
             prompt=str(step["prompt"]),
+            depends_on=tuple(int(n) for n in (step.get("depends_on") or ())),
         )
         for i, step in enumerate(raw_steps)
     ]

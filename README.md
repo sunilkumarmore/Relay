@@ -34,6 +34,9 @@ What holds it together:
   zero, in the application and in a Postgres trigger.
 - **Reputation** (`relay/reputation.py`) — a deterministic function of public
   rows. Recompute it yourself and compare.
+- **Agent state** (`relay/agent/`) — the conversation, intermediate results and
+  artifacts, hashed and checkpointed after every step, so a resumed run picks up
+  the agent rather than just the step counter.
 
 Two ways to run it: **pinned**, where a worker is pointed at one provider (the
 two-machine demo below), or **market**, where it discovers providers, picks by
@@ -231,6 +234,43 @@ python -m relay.controller report --session <id>     # print final report
 4. Dashboard shows real-time request and migration telemetry.
 5. Machine + inference node audit trail is persisted per step.
 
+## Writing a task
+
+Steps share one conversation. Each sees what came before, and can quote an
+earlier answer directly — which also declares the dependency, so execution
+order follows from the prompts:
+
+```yaml
+goal: "Review our Q3 roadmap"
+
+steps:
+  - topic: "Risk analysis"
+    prompt: "List the top 3 risks for shipping Feature A before the auth rewrite."
+
+  - topic: "Dependencies"
+    prompt: "What external dependencies does Feature B introduce?"
+
+  - topic: "Recommendation"
+    prompt: >
+      Given {{ steps.1.solution }} and {{ steps.2.solution }}, recommend a
+      shipping order with justification.
+```
+
+The model is asked for its working and its answer separately, and they are
+stored separately — `{{ steps.1.solution }}` gets the answer alone, not the
+answer buried in its reasoning.
+
+When the next prompt would not fit the provider's advertised context window,
+older turns are folded into a summary and that compaction becomes part of the
+checkpointed state, so a resumed run inherits the same history rather than
+rebuilding a different one.
+
+Steps that need nothing from each other can run concurrently with
+`RELAY_MAX_PARALLEL`. It defaults to 1, and worth knowing before raising it: the
+agent keeps one linear conversation, so a parallel wave sees the history as of
+the *start* of the wave rather than as of each other. Concurrency changes what
+each step reads, not just how fast it runs.
+
 ## Running as a market
 
 The demo above pins a worker to one provider. To run the actual marketplace,
@@ -300,8 +340,8 @@ Selection policies are `cheapest` (default), `fastest`, `round_robin` and
   one interface so it can be swapped.
 - **No human arbitration.** Only hash mismatches and token over-claims are
   adjudicated; subjective quality disputes are recorded and surfaced.
-- **Stateful agents are Phase 6.** Steps still run independently — each is its
-  own prompt, with no context carried between them.
+- **Tool use.** The agent carries `tool_state` through checkpoints, but nothing
+  calls tools yet.
 
 ## Development
 
@@ -377,6 +417,11 @@ relay/
 │   ├── consumer/
 │   │   ├── market.py       # discovery and selection policies
 │   │   └── session.py      # binding, failover, paying
+│   ├── agent/
+│   │   ├── state.py        # the conversation, hashed and checkpointed
+│   │   ├── agent.py        # the step loop and context compaction
+│   │   ├── prompts.py      # prompt building, reasoning/solution split
+│   │   └── plan.py         # dependencies and execution order
 │   ├── worker/
 │   │   ├── daemon.py       # the agent loop
 │   │   ├── tasks.py        # task YAML loading

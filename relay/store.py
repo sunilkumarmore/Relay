@@ -112,6 +112,7 @@ class Store(Protocol):
         tokens_used: int,
         tokens_in: int = 0,
         tokens_out: int = 0,
+        topic: str = "",
     ) -> bool:
         """Insert one step. Returns False when the step already exists.
 
@@ -266,6 +267,26 @@ class Store(Protocol):
         self, receipt_id: str | None = None, status: str | None = None, limit: int = 200
     ) -> list[dict[str, Any]]: ...
 
+    # -- agent state (append-only, one row per completed step) --------------
+    def insert_agent_state(
+        self,
+        session_id: str,
+        step_number: int,
+        state_blob: str,
+        state_hash: str,
+        status: str = "complete",
+    ) -> None: ...
+
+    def get_agent_state(
+        self, session_id: str, step_number: int | None = None, include_partial: bool = False
+    ) -> dict[str, Any] | None:
+        """The state saved at `step_number`, or the latest complete one."""
+        ...
+
+    def list_agent_states(self, session_id: str) -> list[dict[str, Any]]: ...
+
+    def delete_partial_agent_state(self, session_id: str) -> None: ...
+
     def reset_session(self, session_id: str) -> None: ...
 
 
@@ -411,6 +432,7 @@ class SupabaseStore:
         tokens_used: int,
         tokens_in: int = 0,
         tokens_out: int = 0,
+        topic: str = "",
     ) -> bool:
         # Lean on the DB unique constraint on (session_id, step_number) so this is
         # atomic — two workers racing on the same step cannot both succeed.
@@ -430,6 +452,7 @@ class SupabaseStore:
                     "tokens_used": tokens_used,
                     "tokens_in": tokens_in,
                     "tokens_out": tokens_out,
+                    "topic": topic,
                 },
                 on_conflict="session_id,step_number",
                 ignore_duplicates=True,
@@ -785,12 +808,59 @@ class SupabaseStore:
             query = query.eq("status", status)
         return list(query.limit(limit).execute().data or [])
 
+    def insert_agent_state(
+        self,
+        session_id: str,
+        step_number: int,
+        state_blob: str,
+        state_hash: str,
+        status: str = "complete",
+    ) -> None:
+        self.client.table("relay_agent_state").upsert(
+            {
+                "session_id": session_id,
+                "step_number": step_number,
+                "state_blob": state_blob,
+                "state_hash": state_hash,
+                "status": status,
+            },
+            on_conflict="session_id,step_number,status",
+        ).execute()
+
+    def get_agent_state(
+        self, session_id: str, step_number: int | None = None, include_partial: bool = False
+    ) -> dict[str, Any] | None:
+        query = self.client.table("relay_agent_state").select("*").eq("session_id", session_id)
+        if step_number is not None:
+            query = query.eq("step_number", step_number)
+        if not include_partial:
+            query = query.eq("status", "complete")
+        rows = query.order("step_number", desc=True).limit(1).execute().data
+        return rows[0] if rows else None
+
+    def list_agent_states(self, session_id: str) -> list[dict[str, Any]]:
+        data = (
+            self.client.table("relay_agent_state")
+            .select("*")
+            .eq("session_id", session_id)
+            .order("step_number")
+            .execute()
+            .data
+        )
+        return list(data or [])
+
+    def delete_partial_agent_state(self, session_id: str) -> None:
+        self.client.table("relay_agent_state").delete().eq("session_id", session_id).eq(
+            "status", "partial"
+        ).execute()
+
     def reset_session(self, session_id: str) -> None:
         for table in (
             "relay_worker_state",
             "relay_checkpoints",
             "relay_migration_log",
             "relay_inference_log",
+            "relay_agent_state",
             "relay_nodes",
             "relay_registry_requests",
             "relay_sessions",
@@ -815,6 +885,7 @@ TABLES = (
     "ledger_entries",
     "reputation",
     "disputes",
+    "agent_state",
 )
 
 
@@ -976,6 +1047,7 @@ class MemoryStore:
         tokens_used: int,
         tokens_in: int = 0,
         tokens_out: int = 0,
+        topic: str = "",
     ) -> bool:
         with self._txn():
             # Stands in for UNIQUE(session_id, step_number).
@@ -996,6 +1068,7 @@ class MemoryStore:
                     "tokens_used": tokens_used,
                     "tokens_in": tokens_in,
                     "tokens_out": tokens_out,
+                    "topic": topic,
                     "completed_at": now_iso(),
                 }
             )
@@ -1382,6 +1455,65 @@ class MemoryStore:
         ]
         rows.sort(key=lambda r: str(r.get("opened_at", "")))
         return rows[:limit]
+
+    def insert_agent_state(
+        self,
+        session_id: str,
+        step_number: int,
+        state_blob: str,
+        state_hash: str,
+        status: str = "complete",
+    ) -> None:
+        record = {
+            "session_id": session_id,
+            "step_number": step_number,
+            "state_blob": state_blob,
+            "state_hash": state_hash,
+            "status": status,
+            "saved_at": now_iso(),
+        }
+        with self._txn():
+            for row in self.tables["agent_state"]:
+                if (
+                    row["session_id"] == session_id
+                    and int(row["step_number"]) == step_number
+                    and row.get("status") == status
+                ):
+                    row.update(record)
+                    return
+            self.tables["agent_state"].append(record)
+
+    def get_agent_state(
+        self, session_id: str, step_number: int | None = None, include_partial: bool = False
+    ) -> dict[str, Any] | None:
+        tables = self._view()
+        rows = [
+            dict(r)
+            for r in tables["agent_state"]
+            if r["session_id"] == session_id
+            and (step_number is None or int(r["step_number"]) == step_number)
+            and (include_partial or r.get("status") == "complete")
+        ]
+        if not rows:
+            return None
+        # Latest step wins; a partial row for the same step sorts after the
+        # complete one so include_partial genuinely means "prefer the partial".
+        rows.sort(key=lambda r: (int(r["step_number"]), r.get("status") == "partial"))
+        return rows[-1]
+
+    def list_agent_states(self, session_id: str) -> list[dict[str, Any]]:
+        tables = self._view()
+        rows = [dict(r) for r in tables["agent_state"] if r["session_id"] == session_id]
+        rows.sort(key=lambda r: (int(r["step_number"]), str(r.get("status", ""))))
+        return rows
+
+    def delete_partial_agent_state(self, session_id: str) -> None:
+        with self._txn():
+            self.tables["agent_state"] = [
+                r
+                for r in self.tables["agent_state"]
+                if not (r["session_id"] == session_id and r.get("status") == "partial")
+            ]
 
     def reset_session(self, session_id: str) -> None:
         with self._txn():

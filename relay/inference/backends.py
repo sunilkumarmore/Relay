@@ -209,7 +209,13 @@ class FakeBackend:
             raise BackendError(f"injected failure on call {self.calls}")
 
         digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-        text = f"[{model or self.model}] answer {digest[:16]}"
+        label = model or self.model
+        # Mirror the response contract a real provider is asked for, so the
+        # parsing path is exercised rather than stubbed around.
+        text = (
+            f"<reasoning>\n[{label}] working {digest[16:32]}\n</reasoning>\n"
+            f"<solution>\n[{label}] answer {digest[:16]}\n</solution>"
+        )
         return text, max(1, len(prompt) // 4), max(1, len(text) // 4)
 
 

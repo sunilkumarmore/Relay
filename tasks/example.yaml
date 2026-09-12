@@ -29,3 +29,18 @@ steps:
     prompt: >
       Write a 10-item production deployment checklist for a Python web
       application. Each item should be actionable and specific.
+
+# Steps can build on each other. Referring to an earlier answer also declares
+# the dependency, so ordering follows from the prompts rather than from the
+# order they happen to be written in.
+#
+#   - topic: "Recommendation"
+#     prompt: >
+#       Given {{ steps.1.solution }} and {{ steps.2.solution }}, recommend a
+#       shipping order with justification.
+#
+# Use depends_on when a step needs an earlier one without quoting it:
+#
+#   - topic: "Synthesis"
+#     depends_on: [1, 2, 3]
+#     prompt: "Summarize everything decided so far."

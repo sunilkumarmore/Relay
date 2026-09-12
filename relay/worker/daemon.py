@@ -15,6 +15,7 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,10 @@ from typing import Any
 import requests
 
 from relay import config
+from relay.agent import state as agent_state_mod
+from relay.agent.agent import Agent, StepRun
+from relay.agent.plan import waves
+from relay.agent.state import STATUS_PARTIAL, AgentState, StepOutput
 from relay.consumer.market import NoProviderAvailable, Requirements, Selector
 from relay.consumer.session import MarketSession
 from relay.identity import Identity, identity_from_env
@@ -142,11 +147,71 @@ def render_banner(title: str, lines: list[str]) -> None:
     print("+" + "-" * (width + 2) + "+")
 
 
+DEFAULT_CONTEXT_WINDOW = 8192
+
+
+def rehydrate(store: Store, session_id: str, goal: str) -> tuple[AgentState, bool]:
+    """Restore the agent, or start one.
+
+    A partial row is never rehydrated — it was written mid-step by an eviction,
+    so the step it belongs to is redone. That is safe because
+    UNIQUE(session_id, step_number) makes committing a step idempotent, and it
+    is preferable to resuming into a conversation that was only half recorded.
+    """
+    row = store.get_agent_state(session_id)
+    found = row is not None
+    if row is not None:
+        state = agent_state_mod.verify(str(row["state_blob"]), str(row.get("state_hash", "")))
+        state.goal = state.goal or goal
+    else:
+        state = AgentState(goal=goal)
+
+    if found:
+        # A saved conversation is authoritative about what this agent has done.
+        # Topping it up from checkpoints would re-adopt exactly the steps whose
+        # turns were never recorded — the ones that must be redone.
+        return state, True
+
+    # No state at all: a session that predates agent state, or whose rows were
+    # lost. Recover the answers from the checkpoints so later steps can still
+    # reference them. The verbatim transcript is gone, which is a degradation
+    # rather than a failure.
+    for checkpoint in store.get_checkpoints(session_id):
+        number = int(checkpoint["step_number"])
+        if number in state.step_outputs:
+            continue
+        state.record_step(
+            StepOutput(
+                step_number=number,
+                topic=str(checkpoint.get("topic") or f"Step {number}"),
+                solution=str(checkpoint.get("solution", "")),
+                reasoning=str(checkpoint.get("reasoning", "")),
+                tokens_in=int(checkpoint.get("tokens_in") or 0),
+                tokens_out=int(checkpoint.get("tokens_out") or 0),
+            )
+        )
+    return state, False
+
+
+def save_state(store: Store, session_id: str, state: AgentState, step_number: int, status: str) -> None:
+    store.insert_agent_state(
+        session_id=session_id,
+        step_number=step_number,
+        state_blob=state.to_json(),
+        state_hash=state.state_hash(),
+        status=status,
+    )
+
+
 def build_report(store: Store, session_id: str) -> str:
     rows = store.get_checkpoints(session_id)
     lines = [f"Session: {session_id}", "", "=== Worker Report ===", ""]
     for row in rows:
-        lines.extend([f"Step {row['step_number']} ({row['worker_id']}):", str(row.get("solution", "")), ""])
+        header = f"Step {row['step_number']} ({row['worker_id']})"
+        topic = str(row.get("topic") or "")
+        lines.append(f"{header} — {topic}:" if topic else f"{header}:")
+        lines.append(str(row.get("solution", "")))
+        lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -158,6 +223,7 @@ def run_worker(
     max_tokens: int = 1200,
     step_sleep: int = 5,
     max_retries: int = 3,
+    max_parallel: int = 1,
 ) -> int:
     problems: list[Problem] = task.steps
     steps_total = len(problems)
@@ -330,6 +396,100 @@ def run_worker(
     next_step = steps_completed + 1
     runtime.next_problem = get_problem(problems, next_step).prompt if next_step <= steps_total else ""
 
+    agent_state, had_state = rehydrate(store, cfg.session_id, task.goal)
+    if had_state:
+        # The conversation is what says which steps this agent has taken.
+        # A checkpoint written in the instant before the process died has no
+        # turns behind it, and skipping that step on the strength of the
+        # checkpoint alone would leave a permanent hole in the transcript.
+        # Redoing it is free: committing a step is idempotent.
+        solved_steps = set(agent_state.step_outputs)
+    # A partial row was written mid-step by an eviction. That step is redone, so
+    # the half-recorded state it describes is discarded rather than resumed into.
+    store.delete_partial_agent_state(cfg.session_id)
+
+    context_window = (
+        binding.offer.context_window
+        if binding.offer
+        else config.get_int("RELAY_CONTEXT_WINDOW", DEFAULT_CONTEXT_WINDOW)
+    )
+
+    def complete(prompt: str, max_tokens: int, step_number: int = 0) -> dict[str, Any]:
+        result = session.complete(prompt, max_tokens, step_number)
+        # The provider may have changed while that call ran.
+        if session.binding is not None:
+            runtime.inference_node = session.binding.inference_node_id
+            runtime.provider_node_id = session.binding.provider_node_id
+        return result
+
+    agent = Agent(
+        agent_state,
+        complete,
+        context_window=context_window,
+        max_tokens=max_tokens,
+        model=binding.offer.model if binding.offer else "",
+        keep_recent=config.get_int("RELAY_KEEP_RECENT", 4),
+        on_compact=lambda state: print(
+            f"Context compacted ({state.compactions} so far); "
+            f"history is now {len(state.messages)} message(s)"
+        ),
+    )
+
+    def commit(run: StepRun) -> bool:
+        """Record one finished step: conversation, checkpoint, agent state.
+
+        The conversation is updated and saved whatever the checkpoint does, so
+        the two can never drift apart across a crash.
+        """
+        agent.commit_step(run)
+
+        inserted = store.insert_checkpoint(
+            session_id=cfg.session_id,
+            worker_id=cfg.worker_id,
+            step_number=run.output.step_number,
+            # What we actually sent, not the step template — this is the text a
+            # dispute re-hashes and re-counts, so it has to be the real thing.
+            problem=run.prompt,
+            solution=run.output.solution,
+            reasoning=run.output.reasoning,
+            machine_id=cfg.machine_id,
+            inference_node=runtime.inference_node,
+            inference_latency_ms=run.latency_ms,
+            tokens_used=run.tokens_used,
+            tokens_in=run.tokens_in,
+            tokens_out=run.tokens_out,
+            topic=run.output.topic,
+        )
+        save_state(store, cfg.session_id, agent.state, run.output.step_number, "complete")
+        solved_steps.add(run.output.step_number)
+        if not inserted:
+            # Someone already recorded this step — this run, before it died, or
+            # another worker. The billing row stands as it was; our conversation
+            # is now caught up with it.
+            return False
+
+        next_step_num = run.output.step_number + 1
+        store.update_session(
+            cfg.session_id,
+            steps_completed=len(agent.state.step_outputs),
+            status="in_progress",
+            current_machine=cfg.machine_id,
+            inference_node=runtime.inference_node,
+        )
+        store.upsert_state(
+            session_id=cfg.session_id,
+            worker_id=cfg.worker_id,
+            next_step_number=next_step_num,
+            next_problem="",
+            machine_id=cfg.machine_id,
+            inference_node=runtime.inference_node,
+            status="active",
+            provider_node_id=runtime.provider_node_id,
+        )
+        runtime.steps_completed = len(agent.state.step_outputs)
+        runtime.next_step_number = next_step_num
+        return True
+
     heartbeat_stop = threading.Event()
     heartbeat_thread = threading.Thread(
         target=send_heartbeat, args=(heartbeat_stop, session, runtime), daemon=True
@@ -356,6 +516,15 @@ def run_worker(
             status="evicted",
             provider_node_id=runtime.provider_node_id,
         )
+        # Record where the agent had got to, flagged partial. A resumed worker
+        # will not rehydrate it — the step it belongs to is redone — but it
+        # leaves an audit trail of what was in flight when the process died.
+        try:
+            save_state(store, state.session_id, agent.state, state.next_step_number, STATUS_PARTIAL)
+        except Exception as exc:
+            # Losing the audit trail is not worth failing the eviction over: the
+            # checkpoints are what the resume actually depends on.
+            print(f"Could not save partial agent state: {exc}")
         session.release()
         heartbeat_stop.set()
 
@@ -373,81 +542,49 @@ def run_worker(
     eviction.install()
 
     try:
-        for problem in problems:
-            if problem.step_number in solved_steps:
-                continue
+        for wave in waves(problems, done=solved_steps):
+            # A wave can be large — five independent steps are one wave — but
+            # nothing in it is committed until the batch finishes, so the batch
+            # is also the amount of work an eviction can cost. Bound it by the
+            # concurrency limit: at max_parallel=1 that is commit-per-step,
+            # which is the incremental checkpointing Relay exists for.
+            for offset in range(0, len(wave), max_parallel):
+                batch = wave[offset : offset + max_parallel]
+                pending = [(p.step_number, p.topic, p.prompt) for p in batch]
+                agent.prepare_wave(pending)
 
-            runtime.next_step_number = problem.step_number
-            runtime.next_problem = problem.prompt
+                for step_number, topic, _ in pending:
+                    print(f"--- [{cfg.worker_id}] Step {step_number}/{steps_total}: {topic} ---")
+                runtime.next_step_number = pending[0][0]
+                runtime.next_problem = pending[0][2]
 
-            print(f"--- [{cfg.worker_id}] Step {problem.step_number}/{steps_total}: {problem.topic} ---")
-            result = session.complete(problem.prompt, max_tokens, problem.step_number)
+                if len(pending) > 1:
+                    # These steps need nothing from each other, so they can run
+                    # together. They are still committed in step order below, so
+                    # the run is reproducible rather than finish-order dependent.
+                    with ThreadPoolExecutor(max_workers=len(pending)) as pool:
+                        futures = [
+                            pool.submit(agent.execute_step, number, topic, instruction)
+                            for number, topic, instruction in pending
+                        ]
+                        runs = [future.result() for future in as_completed(futures)]
+                else:
+                    number, topic, instruction = pending[0]
+                    runs = [agent.execute_step(number, topic, instruction)]
 
-            # The provider may have changed while this step ran.
-            if session.binding is not None:
-                runtime.inference_node = session.binding.inference_node_id
-                runtime.provider_node_id = session.binding.provider_node_id
+                for run in sorted(runs, key=lambda r: r.output.step_number):
+                    if not run.well_formed:
+                        print(
+                            f"Step {run.output.step_number}: response did not follow the "
+                            "reasoning/solution format; recording the whole reply as the answer"
+                        )
+                    print(f"Inference latency: {run.latency_ms} ms")
+                    if commit(run):
+                        print("Checkpoint saved")
 
-            latency_ms = int(result.get("latency_ms") or 0)
-            tokens_used = int(result.get("tokens_used") or 0)
-            tokens_in = int(result.get("tokens_in") or 0)
-            tokens_out = int(result.get("tokens_out") or 0)
-            solution = str(result.get("response", "")).strip()
-            print(f"Inference latency: {latency_ms} ms")
-
-            inserted = store.insert_checkpoint(
-                session_id=cfg.session_id,
-                worker_id=cfg.worker_id,
-                step_number=problem.step_number,
-                problem=problem.prompt,
-                solution=solution,
-                reasoning=solution,
-                machine_id=cfg.machine_id,
-                inference_node=runtime.inference_node,
-                inference_latency_ms=latency_ms,
-                tokens_used=tokens_used,
-                tokens_in=tokens_in,
-                tokens_out=tokens_out,
-            )
-            if not inserted:
-                # Another worker already committed this step; adopt it and move on.
-                solved_steps.add(problem.step_number)
-                continue
-
-            next_step_num = problem.step_number + 1
-            next_problem_text = ""
-            if next_step_num <= steps_total:
-                next_problem_text = get_problem(problems, next_step_num).prompt
-
-            store.update_session(
-                cfg.session_id,
-                steps_completed=problem.step_number,
-                status="in_progress",
-                current_machine=cfg.machine_id,
-                inference_node=runtime.inference_node,
-            )
-            store.upsert_state(
-                session_id=cfg.session_id,
-                worker_id=cfg.worker_id,
-                next_step_number=next_step_num,
-                next_problem=next_problem_text,
-                machine_id=cfg.machine_id,
-                inference_node=runtime.inference_node,
-                status="active",
-                provider_node_id=runtime.provider_node_id,
-            )
-            # No insert_inference_log here: the provider already logged this call
-            # when it served it, and it measures latency and tokens at the source.
-            # Writing it from both sides double-counted every request.
-            runtime.steps_completed = problem.step_number
-            runtime.next_step_number = next_step_num
-            runtime.next_problem = next_problem_text
-            solved_steps.add(problem.step_number)
-
-            print("Checkpoint saved")
-            if problem.step_number < steps_total and step_sleep > 0:
-                print(f"Sleeping {step_sleep} seconds...")
-                time.sleep(step_sleep)
+                if len(solved_steps) < steps_total and step_sleep > 0:
+                    print(f"Sleeping {step_sleep} seconds...")
+                    time.sleep(step_sleep)
 
         report = build_report(store, cfg.session_id)
         report_path = out_dir / f"final_report_{cfg.worker_id}_{cfg.session_id}.txt"
@@ -515,6 +652,7 @@ def main() -> int:
         max_tokens=config.get_int("MAX_TOKENS", 1200),
         step_sleep=config.get_int("STEP_SLEEP_SECONDS", 5),
         max_retries=config.get_int("RELAY_MAX_RETRIES", 3),
+        max_parallel=config.get_int("RELAY_MAX_PARALLEL", 1),
     )
 
 

@@ -6,8 +6,8 @@ marketplace. Each phase below is a **prompt to paste into a fresh Claude Code se
 
 ## Status
 
-Phases 0-5 are **built and merged**. Phase 6 (stateful agent checkpointing),
-Phase 7 (CLI and web surfaces) and Phase 8 (hardening) are still prompts.
+Phases 0-6 are **built**. Phase 7 (CLI and web surfaces) and Phase 8
+(hardening) are still prompts.
 
 | Phase | State | What landed |
 |---|---|---|
@@ -17,13 +17,13 @@ Phase 7 (CLI and web surfaces) and Phase 8 (hardening) are still prompts.
 | 3 Discovery | done | Directory, selection policies, mid-job failover |
 | 4 Ledger | done | Signed receipts, token bound, double-entry credits |
 | 5 Reputation | done | Deterministic scores, adjudicated disputes, stake and slashing |
-| 6 Stateful agent | **next** | Context between steps, full agent state checkpointed |
-| 7 Surfaces | pending | `relay` CLI, web market dashboard, docker compose |
+| 6 Stateful agent | done | Context between steps, hashed agent state, compaction, dependencies |
+| 7 Surfaces | **next** | `relay` CLI, web market dashboard, docker compose |
 | 8 Hardening | pending | TLS, rate limits, metrics, chaos runs |
 
-Phase 6 is the one that matters most for the pitch: steps still run
-independently, so what exists is a resumable *queue*, not yet a resumable
-*agent*.
+With Phase 6 in, Relay is a resumable *agent* rather than a resumable queue:
+steps share one conversation, quote each other's answers, and a run killed
+without warning resumes into the same conversation it would have had.
 
 ## How to use this document
 

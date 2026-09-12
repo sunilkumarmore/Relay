@@ -136,7 +136,9 @@ class WorkerProcess:
     session_id: str
 
     def checkpoint_count(self) -> int:
-        return len(self.store.snapshot()["checkpoints"])
+        # This session's steps only. A store shared with another run would
+        # otherwise report that one's progress as this one's.
+        return len(self.store.get_checkpoints(self.session_id))
 
     def wait_for_checkpoints(self, count: int, timeout: float = 30.0) -> bool:
         deadline = time.time() + timeout
@@ -166,6 +168,7 @@ def spawn_worker(tmp_path: Path):
         max_retries: int = 3,
         policy: str = "cheapest",
         verify_sample_rate: float = 0.0,
+        max_parallel: int = 1,
     ) -> WorkerProcess:
         env = dict(os.environ)
         env.update(
@@ -181,6 +184,7 @@ def spawn_worker(tmp_path: Path):
                 "RELAY_POLICY": policy,
                 "RELAY_FAILOVER_COOLDOWN": "300",
                 "RELAY_VERIFY_SAMPLE_RATE": str(verify_sample_rate),
+                "RELAY_MAX_PARALLEL": str(max_parallel),
                 "WORKER_ID": worker_id,
                 "MACHINE_ID": machine_id,
                 "SESSION_ID": session_id,
