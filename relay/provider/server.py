@@ -123,8 +123,11 @@ class Provider:
         *,
         identity: Identity | None = None,
         node_id: str = "",
+        min_stake: float = 0.0,
     ) -> None:
         self.config = provider_config
+        # Credits this node must have at risk before its offers are listed.
+        self.min_stake = min_stake
         self.store = store
         self.identity = identity or Identity.generate()
         # The human label for this provider, used in telemetry and the dashboard.
@@ -165,8 +168,31 @@ class Provider:
             for offering in self.config.models
         ]
 
+    def stake(self) -> float:
+        if self.store is None:
+            return 0.0
+        try:
+            account = self.store.get_account(self.identity.node_id) or {}
+        except Exception:
+            return 0.0
+        return float(account.get("stake") or 0.0)
+
+    def is_staked(self) -> bool:
+        return self.min_stake <= 0 or self.stake() >= self.min_stake
+
     def publish_offers(self, at: datetime | None = None) -> list[Offer]:
         """Refresh this provider's advertisements in the directory."""
+        if not self.is_staked():
+            # Nothing at risk, nothing listed. A slash has to be able to cost
+            # something, or the penalty is theatre.
+            print(
+                f"Not advertising: stake {self.stake()} is below the {self.min_stake} required. "
+                "Top up with: python -m relay.controller wallet stake --amount N"
+            )
+            self.withdraw_offers()
+            self._record_event("understaked", "", {"stake": self.stake(), "required": self.min_stake})
+            return []
+
         offers = self.build_offers(at)
         self._offers = {offer.model: offer for offer in offers}
         if self.store is not None:
@@ -641,6 +667,7 @@ def provider_from_env() -> Provider:
         store_from_env(optional=True),
         identity=identity_from_env(),
         node_id=env.get("MACHINE_ID") or socket.gethostname(),
+        min_stake=env.get_float("RELAY_MIN_STAKE", 0.0),
     )
 
 

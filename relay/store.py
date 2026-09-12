@@ -249,6 +249,23 @@ class Store(Protocol):
         limit: int = 1000,
     ) -> list[dict[str, Any]]: ...
 
+    # -- reputation and disputes -------------------------------------------
+    def upsert_reputation(
+        self, node_id: str, role: str, score: float, components: dict[str, Any], computed_at: str
+    ) -> None: ...
+
+    def get_reputation(self, node_id: str, role: str = "provider") -> dict[str, Any] | None: ...
+
+    def list_reputation(self, role: str | None = None) -> list[dict[str, Any]]: ...
+
+    def upsert_dispute(self, dispute: dict[str, Any]) -> None: ...
+
+    def get_dispute(self, dispute_id: str) -> dict[str, Any] | None: ...
+
+    def list_disputes(
+        self, receipt_id: str | None = None, status: str | None = None, limit: int = 200
+    ) -> list[dict[str, Any]]: ...
+
     def reset_session(self, session_id: str) -> None: ...
 
 
@@ -712,6 +729,62 @@ class SupabaseStore:
                 query = query.eq(column, value)
         return list(query.limit(limit).execute().data or [])
 
+    def upsert_reputation(
+        self, node_id: str, role: str, score: float, components: dict[str, Any], computed_at: str
+    ) -> None:
+        self.client.table("relay_reputation").upsert(
+            {
+                "node_id": node_id,
+                "role": role,
+                "score": score,
+                "components": components,
+                "computed_at": computed_at,
+            },
+            on_conflict="node_id,role",
+        ).execute()
+
+    def get_reputation(self, node_id: str, role: str = "provider") -> dict[str, Any] | None:
+        rows = (
+            self.client.table("relay_reputation")
+            .select("*")
+            .eq("node_id", node_id)
+            .eq("role", role)
+            .limit(1)
+            .execute()
+            .data
+        )
+        return rows[0] if rows else None
+
+    def list_reputation(self, role: str | None = None) -> list[dict[str, Any]]:
+        query = self.client.table("relay_reputation").select("*")
+        if role is not None:
+            query = query.eq("role", role)
+        return list(query.execute().data or [])
+
+    def upsert_dispute(self, dispute: dict[str, Any]) -> None:
+        self.client.table("relay_disputes").upsert(dispute, on_conflict="dispute_id").execute()
+
+    def get_dispute(self, dispute_id: str) -> dict[str, Any] | None:
+        rows = (
+            self.client.table("relay_disputes")
+            .select("*")
+            .eq("dispute_id", dispute_id)
+            .limit(1)
+            .execute()
+            .data
+        )
+        return rows[0] if rows else None
+
+    def list_disputes(
+        self, receipt_id: str | None = None, status: str | None = None, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        query = self.client.table("relay_disputes").select("*")
+        if receipt_id is not None:
+            query = query.eq("receipt_id", receipt_id)
+        if status is not None:
+            query = query.eq("status", status)
+        return list(query.limit(limit).execute().data or [])
+
     def reset_session(self, session_id: str) -> None:
         for table in (
             "relay_worker_state",
@@ -740,6 +813,8 @@ TABLES = (
     "accounts",
     "ledger_tx",
     "ledger_entries",
+    "reputation",
+    "disputes",
 )
 
 
@@ -1252,6 +1327,62 @@ class MemoryStore:
         ]
         return rows[:limit]
 
+    def upsert_reputation(
+        self, node_id: str, role: str, score: float, components: dict[str, Any], computed_at: str
+    ) -> None:
+        record = {
+            "node_id": node_id,
+            "role": role,
+            "score": score,
+            "components": components,
+            "computed_at": computed_at,
+        }
+        with self._txn():
+            for row in self.tables["reputation"]:
+                if row["node_id"] == node_id and row.get("role") == role:
+                    row.update(record)
+                    return
+            self.tables["reputation"].append(record)
+
+    def get_reputation(self, node_id: str, role: str = "provider") -> dict[str, Any] | None:
+        tables = self._view()
+        for row in tables["reputation"]:
+            if row["node_id"] == node_id and row.get("role") == role:
+                return dict(row)
+        return None
+
+    def list_reputation(self, role: str | None = None) -> list[dict[str, Any]]:
+        tables = self._view()
+        return [dict(r) for r in tables["reputation"] if role is None or r.get("role") == role]
+
+    def upsert_dispute(self, dispute: dict[str, Any]) -> None:
+        with self._txn():
+            for row in self.tables["disputes"]:
+                if row["dispute_id"] == dispute["dispute_id"]:
+                    row.update(dispute)
+                    return
+            self.tables["disputes"].append(dict(dispute))
+
+    def get_dispute(self, dispute_id: str) -> dict[str, Any] | None:
+        tables = self._view()
+        for row in tables["disputes"]:
+            if row["dispute_id"] == dispute_id:
+                return dict(row)
+        return None
+
+    def list_disputes(
+        self, receipt_id: str | None = None, status: str | None = None, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        tables = self._view()
+        rows = [
+            dict(r)
+            for r in tables["disputes"]
+            if (receipt_id is None or r.get("receipt_id") == receipt_id)
+            and (status is None or r.get("status") == status)
+        ]
+        rows.sort(key=lambda r: str(r.get("opened_at", "")))
+        return rows[:limit]
+
     def reset_session(self, session_id: str) -> None:
         with self._txn():
             for name in self.tables:
@@ -1298,11 +1429,15 @@ class FileStore(MemoryStore):
         return self._read()
 
     def _begin(self) -> None:
-        if self._depth == 0 and fcntl is not None:
-            self._fh = open(self._lock_path, "a+")  # noqa: SIM115 - released in _commit
-            fcntl.flock(self._fh, fcntl.LOCK_EX)
+        # Only the outermost transaction takes the lock and loads the file. A
+        # nested one — an eviction handler firing mid-write, say — must join the
+        # transaction already in progress, not re-read over its uncommitted work.
+        if self._depth == 0:
+            if fcntl is not None:
+                self._fh = open(self._lock_path, "a+")  # noqa: SIM115 - released in _commit
+                fcntl.flock(self._fh, fcntl.LOCK_EX)
+            self.tables = self._read()
         self._depth += 1
-        self.tables = self._read()
 
     def _commit(self) -> None:
         self._depth -= 1

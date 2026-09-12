@@ -6,8 +6,18 @@ from rich.console import Console
 from rich.table import Table
 
 from relay import config
+from relay.disputes import (
+    DEFAULT_MIN_STAKE,
+    OBJECTIVE_REASONS,
+    Dispute,
+    adjudicate,
+    adjudicate_open,
+    open_dispute,
+    set_stake,
+)
 from relay.identity import identity_from_env
 from relay.ledger import Ledger, LedgerError, sweep_expired_holds
+from relay.reputation import recompute as recompute_reputation
 from relay.store import RelayStoreError, Store, store_from_env
 
 console = Console()
@@ -297,6 +307,146 @@ def earnings_cmd() -> None:
         table.add_row(status, f"{buckets[status]:.6f}")
     console.print(table)
     console.print(f"Settled balance: {Ledger(store).balance(node_id):.6f}")
+
+
+@wallet.command("stake")
+@click.option("--amount", type=float, required=True, help="Credits to put at risk")
+def wallet_stake_cmd(amount: float) -> None:
+    """Put credits at risk so this node's offers are listed.
+
+    Stake is what a slash draws from. A provider with nothing at risk has
+    nothing to lose, so the market does not list it.
+    """
+    store, _ = load_config()
+    node_id = identity_from_env().node_id
+    staked = set_stake(store, Ledger(store), node_id, amount)
+    if staked < amount:
+        console.print(f"Only staked {staked:.6f} — you cannot stake more than you hold.")
+    console.print(f"Stake for {node_id[:16]}: {staked:.6f} (minimum {DEFAULT_MIN_STAKE})")
+
+
+@cli.group("reputation")
+def reputation_group() -> None:
+    """Scores computed from public evidence. Recompute them yourself."""
+
+
+@reputation_group.command("recompute")
+def reputation_recompute_cmd() -> None:
+    """Rescore every node from the stored receipts, observations and offers."""
+    store, _ = load_config()
+    scores = recompute_reputation(store)
+
+    table = Table(title="Reputation")
+    for column in ("Node", "Role", "Score"):
+        table.add_column(column)
+    for score in sorted(scores, key=lambda s: (-s.score, s.node_id)):
+        table.add_row(score.node_id[:16], score.role, f"{score.score:.4f}")
+    console.print(table)
+    console.print(f"Scored {len(scores)} node(s). This is a pure function of public rows.")
+
+
+@reputation_group.command("show")
+@click.argument("node_id")
+@click.option("--role", default="provider", show_default=True)
+def reputation_show_cmd(node_id: str, role: str) -> None:
+    """Show a node's score and the working behind it."""
+    store, _ = load_config()
+    row = store.get_reputation(node_id, role)
+    if row is None:
+        console.print(f"No score for {node_id[:16]} as {role}. Run: reputation recompute")
+        raise SystemExit(1)
+
+    console.print(f"{node_id[:16]} ({role}): {float(row['score']):.4f}")
+    table = Table(title="Components")
+    table.add_column("Component")
+    table.add_column("Value")
+    table.add_column("Evidence")
+    for name, detail in (row.get("components") or {}).items():
+        value = detail.get("value") if isinstance(detail, dict) else detail
+        rest = (
+            ", ".join(f"{k}={v}" for k, v in detail.items() if k != "value")
+            if isinstance(detail, dict)
+            else ""
+        )
+        table.add_row(name, "-" if value is None else f"{float(value):.4f}", rest)
+    console.print(table)
+
+
+@cli.group("disputes")
+def disputes_group() -> None:
+    """Challenges to a receipt, and their rulings."""
+
+
+@disputes_group.command("ls")
+@click.option("--status", default=None, help="open, upheld, rejected, unadjudicated")
+def disputes_ls_cmd(status: str | None) -> None:
+    """List disputes."""
+    store, _ = load_config()
+    table = Table(title="Disputes")
+    for column in ("Dispute", "Receipt", "Reason", "Status", "Opened by"):
+        table.add_column(column)
+    for row in store.list_disputes(status=status):
+        table.add_row(
+            str(row["dispute_id"])[:8],
+            str(row["receipt_id"])[:8],
+            str(row.get("reason", "")),
+            str(row.get("status", "")),
+            str(row.get("opened_by", ""))[:12],
+        )
+    console.print(table)
+
+
+@disputes_group.command("open")
+@click.argument("receipt_id")
+@click.option(
+    "--reason",
+    type=click.Choice([*OBJECTIVE_REASONS, "other"]),
+    required=True,
+    help="Only the objective reasons can be adjudicated automatically",
+)
+@click.option("--max-tokens", type=int, default=1200, show_default=True)
+def disputes_open_cmd(receipt_id: str, reason: str, max_tokens: int) -> None:
+    """Challenge a receipt."""
+    store, _ = load_config()
+    if store.get_receipt(receipt_id) is None:
+        console.print(f"No receipt {receipt_id}")
+        raise SystemExit(1)
+    dispute = open_dispute(
+        store,
+        receipt_id=receipt_id,
+        opened_by=identity_from_env().node_id,
+        reason=reason,
+        evidence={"max_tokens": max_tokens},
+    )
+    console.print(f"Opened dispute {dispute.dispute_id[:8]} against receipt {receipt_id[:8]}")
+    if reason == "other":
+        console.print("Subjective disputes are recorded and surfaced, not ruled on automatically.")
+
+
+@disputes_group.command("adjudicate")
+@click.option("--dispute", "dispute_id", default=None, help="One dispute; omit for every open one")
+def disputes_adjudicate_cmd(dispute_id: str | None) -> None:
+    """Rule on open disputes from the signed evidence."""
+    store, _ = load_config()
+    ledger = Ledger(store)
+
+    if dispute_id:
+        row = store.get_dispute(dispute_id)
+        if row is None:
+            console.print(f"No dispute {dispute_id}")
+            raise SystemExit(1)
+        resolved = [adjudicate(store, ledger, Dispute.from_row(row))]
+    else:
+        resolved = adjudicate_open(store, ledger)
+
+    if not resolved:
+        console.print("Nothing open to rule on.")
+        return
+    for dispute in resolved:
+        console.print(f"{dispute.dispute_id[:8]} ({dispute.reason}): {dispute.status}")
+        for key, value in dispute.evidence.items():
+            if key != "problems":
+                console.print(f"    {key}: {value}")
 
 
 def run() -> None:

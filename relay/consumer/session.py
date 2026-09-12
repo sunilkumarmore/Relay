@@ -30,6 +30,7 @@ from relay.consumer.market import (
     Requirements,
     Selector,
 )
+from relay.disputes import REASON_HASH_MISMATCH, REASON_TOKEN_OVERCLAIM, open_dispute
 from relay.identity import Identity
 from relay.ledger import Ledger
 from relay.provider.offers import Offer
@@ -78,6 +79,8 @@ class MarketSession:
         on_switch: Callable[[str, str, str], None] | None = None,
         prefer_provider: str | None = None,
         ledger: Ledger | None = None,
+        min_stake: float = 0.0,
+        verify_sample_rate: float = 0.0,
     ) -> None:
         self.identity = identity
         self.store = store
@@ -91,13 +94,15 @@ class MarketSession:
         self.on_switch = on_switch
         self.prefer_provider = prefer_provider or None
 
-        self.directory = Directory(store)
+        self.directory = Directory(store, min_stake=min_stake)
+        self.verify_sample_rate = max(0.0, min(1.0, verify_sample_rate))
         self.bench = Bench(cooldown_seconds)
         self.ledger = ledger
         self.binding: Binding | None = None
         self.switches = 0
         self.spent = 0.0
         self.disputed: list[Receipt] = []
+        self.verifications: list[dict[str, Any]] = []
 
     @property
     def auth(self) -> RelayAuth:
@@ -331,6 +336,11 @@ class MarketSession:
             job_id=self.session_id,
             step_number=step_number,
         )
+        if self._should_sample():
+            # An audit, not a verdict — run it regardless of how the bill checks
+            # out, since the point is to find patterns over many calls.
+            self._cross_check(binding, prompt, max_tokens, result)
+
         problems += self._token_objections(receipt, prompt, response_text, binding.offer.model)
 
         if problems:
@@ -339,6 +349,7 @@ class MarketSession:
             disputed = receipt.disputed(reason)
             self.disputed.append(disputed)
             self._save_receipt(disputed)
+            self._open_dispute(receipt, problems, max_tokens)
             return
 
         acknowledged = receipt.acknowledged_by(self.identity)
@@ -377,6 +388,91 @@ class MarketSession:
                     f"(tolerance {int(measured.tolerance * 100)}%)"
                 )
         return objections
+
+    def _open_dispute(self, receipt: Receipt, problems: list[str], max_tokens: int) -> None:
+        """Raise it formally, but only for the kinds a program can rule on."""
+        if self.store is None:
+            return
+        joined = " ".join(problems)
+        if "tokens claimed" in joined:
+            reason = REASON_TOKEN_OVERCLAIM
+        elif "hash does not match" in joined:
+            reason = REASON_HASH_MISMATCH
+        else:
+            # Price or identity mismatches are real, but they are settled by
+            # simply not paying; there is nothing for an adjudicator to weigh.
+            return
+        try:
+            open_dispute(
+                self.store,
+                receipt_id=receipt.receipt_id,
+                opened_by=self.identity.node_id,
+                reason=reason,
+                evidence={"problems": problems, "max_tokens": max_tokens},
+            )
+        except Exception:
+            pass
+
+    def _should_sample(self) -> bool:
+        if self.verify_sample_rate <= 0:
+            return False
+        import random
+
+        return random.random() < self.verify_sample_rate
+
+    def _cross_check(
+        self, binding: Binding, prompt: str, max_tokens: int, result: dict[str, Any]
+    ) -> None:
+        """Ask a second provider the same question and compare.
+
+        For a deterministic model this is an exact comparison. Otherwise all it
+        can honestly check is plausibility — that the token counts and latency
+        are in the same world. Either way the outcome feeds reputation rather
+        than triggering a payment: sampling finds patterns, not verdicts.
+        """
+        if binding.offer is None:
+            return
+        others = [
+            o
+            for o in self.candidates()
+            if o.provider_node_id != binding.provider_node_id and o.model == binding.offer.model
+        ]
+        if not others:
+            return
+
+        second = others[0]
+        try:
+            node_label = self._register(second.endpoint_url)
+            other_binding = Binding(second.endpoint_url, second.provider_node_id, node_label, second)
+            other = self._attempt(other_binding, prompt, max_tokens)
+        except Exception:
+            # The cross-check failing says nothing about the provider we bought
+            # from, so it is not evidence against anyone.
+            return
+
+        ours = str(result.get("response", "")).strip()
+        theirs = str(other.get("response", "")).strip()
+        our_tokens = int(result.get("tokens_out") or 0)
+        their_tokens = int(other.get("tokens_out") or 0)
+        ceiling = max(their_tokens * 3, their_tokens + 32)
+
+        finding = {
+            "provider_node_id": binding.provider_node_id,
+            "compared_with": second.provider_node_id,
+            "identical": ours == theirs,
+            "tokens_out": our_tokens,
+            "other_tokens_out": their_tokens,
+            "plausible": our_tokens <= ceiling,
+        }
+        self.verifications.append(finding)
+
+        if self.store is not None:
+            try:
+                self.store.insert_provider_event(
+                    binding.provider_node_id, "cross_checked", binding.offer.model, finding
+                )
+            except Exception:
+                pass
 
     def _save_receipt(self, receipt: Receipt) -> None:
         if self.store is None:

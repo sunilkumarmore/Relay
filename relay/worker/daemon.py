@@ -164,6 +164,10 @@ def run_worker(
     out_dir = output_dir()
     out_dir.mkdir(parents=True, exist_ok=True)
     requirements = Requirements.from_dict(task.requirements)
+    if not requirements.min_reputation:
+        # A provider with a bad record is skipped by default; one with no record
+        # is not, since the prior sits above this floor.
+        requirements.min_reputation = config.get_float("RELAY_MIN_REPUTATION", 0.0)
     ledger = Ledger(store)
 
     if cfg.inference_registry:
@@ -224,6 +228,8 @@ def run_worker(
         # A resumed worker goes back to the provider it was using, if it still qualifies.
         prefer_provider=(existing_state or {}).get("provider_node_id"),
         ledger=ledger,
+        min_stake=config.get_float("RELAY_MIN_STAKE", 0.0),
+        verify_sample_rate=config.get_float("RELAY_VERIFY_SAMPLE_RATE", 0.0),
     )
 
     if requirements.budget_credits:

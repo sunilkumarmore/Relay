@@ -134,14 +134,30 @@ def test_region_orders_results():
     assert ranked[0].offer_id == near.offer_id, "local first, even at a higher price"
 
 
-def test_min_reputation_excludes_unproven_providers():
+def test_min_reputation_excludes_a_bad_record():
     store = MemoryStore()
-    trusted = publish(store)
-    publish(store)
+    good = publish(store)
+    bad = publish(store)
     found = Directory(store).find_offers(
-        Requirements(min_reputation=0.5), reputations={trusted.provider_node_id: 0.9}
+        Requirements(min_reputation=0.6),
+        reputations={good.provider_node_id: 0.9, bad.provider_node_id: 0.2},
     )
-    assert [o.offer_id for o in found] == [trusted.offer_id]
+    assert [o.offer_id for o in found] == [good.offer_id]
+
+
+def test_an_unscored_provider_sits_at_the_prior_not_at_zero():
+    """Being new is not the same as being bad. A node with no history should be
+    usable by default, and only excluded by a threshold above the prior."""
+    from relay.consumer.market import UNSCORED
+
+    store = MemoryStore()
+    newcomer = publish(store)
+
+    lenient = Directory(store).find_offers(Requirements(min_reputation=UNSCORED - 0.1), reputations={})
+    strict = Directory(store).find_offers(Requirements(min_reputation=UNSCORED + 0.1), reputations={})
+
+    assert [o.offer_id for o in lenient] == [newcomer.offer_id]
+    assert strict == []
 
 
 def test_requirements_from_yaml_dict():

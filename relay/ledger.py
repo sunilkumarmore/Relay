@@ -177,7 +177,16 @@ class Ledger:
     def settle(
         self, consumer_node_id: str, provider_node_id: str, amount: float, *, receipt_id: str, job_id: str
     ) -> str:
-        """Pay one acknowledged receipt out of the job's hold."""
+        """Pay one acknowledged receipt out of the job's hold.
+
+        A settlement cannot exceed what the job committed. Without this a job
+        could spend past its budget, which would make the hold decorative.
+        """
+        outstanding = self.held_balance(consumer_node_id, job_id)
+        if outstanding + 1e-9 < amount:
+            raise InsufficientFunds(
+                f"job {job_id} holds {outstanding} credits, receipt needs {amount}"
+            )
         return self._post(
             SETTLE,
             [
@@ -210,6 +219,10 @@ class Ledger:
         self.release(node_id, outstanding, job_id)
         return outstanding
 
+    def recoverable(self, node_id: str, amount: float) -> float:
+        """How much of `amount` this node can actually cover."""
+        return round(min(amount, max(self.balance(node_id), 0.0)), 6)
+
     def refund(
         self,
         consumer_node_id: str,
@@ -220,6 +233,8 @@ class Ledger:
         job_id: str = "",
     ) -> str:
         """Undo a settlement an upheld dispute reversed."""
+        if amount <= 0:
+            return ""
         return self._post(
             REFUND,
             [
@@ -232,7 +247,15 @@ class Ledger:
         )
 
     def slash(self, node_id: str, amount: float, *, reason: str = "", ref_receipt_id: str = "") -> str:
-        """Take credits out of a node's balance as a penalty."""
+        """Take credits out of a node's balance as a penalty.
+
+        Capped at what the node actually holds. A negative balance would be a
+        debt nothing in the system can collect, and would mean credits were paid
+        out that never existed — which is precisely what stake is for.
+        """
+        amount = min(amount, max(self.balance(node_id), 0.0))
+        if amount <= 0:
+            return ""
         return self._post(
             SLASH,
             [Entry(WORLD, debit=amount), Entry(available(node_id), credit=amount)],

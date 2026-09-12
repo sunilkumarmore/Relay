@@ -247,3 +247,31 @@ def test_sweep_releases_a_hold_for_a_completed_job():
 def test_account_names_separate_available_from_held():
     assert available("abc") == "abc:available"
     assert held("abc", "job-1") == "abc:held:job-1"
+
+
+def test_a_settlement_cannot_exceed_the_job_hold(ledger):
+    """Otherwise the hold is decorative and a job can spend past its budget."""
+    ledger.deposit(CONSUMER, 100.0)
+    ledger.hold(CONSUMER, 2.0, "job-1")
+
+    with pytest.raises(InsufficientFunds, match="holds 2.0 credits"):
+        ledger.settle(CONSUMER, PROVIDER, 5.0, receipt_id="r1", job_id="job-1")
+
+    assert ledger.balance(PROVIDER) == 0.0
+    ledger.check_invariant()
+
+
+def test_a_slash_cannot_drive_a_balance_negative(ledger):
+    """A negative balance is a debt nothing can collect — it means credits were
+    paid out that never existed."""
+    ledger.deposit(PROVIDER, 3.0)
+    ledger.slash(PROVIDER, 100.0, reason="huge penalty")
+
+    assert ledger.balance(PROVIDER) == 0.0
+    ledger.check_invariant()
+
+
+def test_recoverable_reports_what_a_node_can_actually_cover(ledger):
+    ledger.deposit(PROVIDER, 4.0)
+    assert ledger.recoverable(PROVIDER, 10.0) == 4.0
+    assert ledger.recoverable(PROVIDER, 1.0) == 1.0

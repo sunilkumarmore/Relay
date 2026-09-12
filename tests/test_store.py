@@ -213,3 +213,25 @@ def test_concurrent_writers_across_processes_do_not_lose_rows(tmp_path):
         assert proc.wait(timeout=60) == 0
 
     assert len(FileStore(path).snapshot()["migration_log"]) == 60
+
+
+def test_a_nested_write_does_not_discard_the_outer_one(tmp_path):
+    """A signal handler firing mid-write is a nested transaction. It must join
+    the one in progress, not re-read the file over its uncommitted work."""
+    store = FileStore(tmp_path / "nested.json")
+
+    with store._txn():
+        store.tables["checkpoints"].append({**CHECKPOINT, "step_number": 1})
+        # Re-entrant call, exactly as an eviction handler would make.
+        store.insert_migration_event(
+            session_id="s1",
+            worker_id="w1",
+            event="evicted",
+            from_machine="m1",
+            to_machine=None,
+            step_at_event=1,
+        )
+
+    snapshot = store.snapshot()
+    assert len(snapshot["checkpoints"]) == 1, "the outer write was lost"
+    assert [e["event"] for e in snapshot["migration_log"]] == ["evicted"]

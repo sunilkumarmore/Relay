@@ -165,6 +165,7 @@ def spawn_worker(tmp_path: Path):
         step_sleep: int = 0,
         max_retries: int = 3,
         policy: str = "cheapest",
+        verify_sample_rate: float = 0.0,
     ) -> WorkerProcess:
         env = dict(os.environ)
         env.update(
@@ -179,6 +180,7 @@ def spawn_worker(tmp_path: Path):
                 "RELAY_MAX_RETRIES": str(max_retries),
                 "RELAY_POLICY": policy,
                 "RELAY_FAILOVER_COOLDOWN": "300",
+                "RELAY_VERIFY_SAMPLE_RATE": str(verify_sample_rate),
                 "WORKER_ID": worker_id,
                 "MACHINE_ID": machine_id,
                 "SESSION_ID": session_id,

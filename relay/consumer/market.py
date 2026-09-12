@@ -31,6 +31,11 @@ DEFAULT_FAILOVER_COOLDOWN_SECONDS = 120
 # Observations older than this say nothing about how a provider is doing now.
 HEALTH_WINDOW = timedelta(minutes=30)
 
+# What a provider with no reputation row is treated as. Matches the smoothing
+# prior in relay.reputation, so an unscored node and a freshly scored one with
+# no history land in the same place.
+UNSCORED = 0.5
+
 
 class NoProviderAvailable(RuntimeError):
     """No offer in the directory meets the requirements — or every one that did
@@ -89,8 +94,11 @@ def _opt_int(value: Any) -> int | None:
 class Directory:
     """Read-side view of the market."""
 
-    def __init__(self, store: Store | None) -> None:
+    def __init__(self, store: Store | None, *, min_stake: float = 0.0) -> None:
         self.store = store
+        # Providers with nothing at risk are not listed: a slash has to be able
+        # to cost them something, or the penalty is theatre.
+        self.min_stake = min_stake
 
     def all_offers(self, model: str | None = None, at: datetime | None = None) -> list[Offer]:
         """Every offer that is currently a live, authentic commitment."""
@@ -119,12 +127,30 @@ class Directory:
         at: datetime | None = None,
         reputations: dict[str, float] | None = None,
     ) -> list[Offer]:
-        reputations = reputations or {}
+        if reputations is None:
+            reputations = self.reputations()
+        offers = self.all_offers(requirements.model, at)
+
+        if self.min_stake > 0 and self.store is not None:
+            from relay.disputes import staked_providers
+
+            staked = staked_providers(self.store, self.min_stake)
+            offers = [o for o in offers if o.provider_node_id in staked]
+
         return [
             offer
-            for offer in self.all_offers(requirements.model, at)
-            if requirements.accepts(offer, reputations.get(offer.provider_node_id, 0.0))
+            for offer in offers
+            # An unscored provider gets the prior, not zero: being new is not
+            # the same as being bad.
+            if requirements.accepts(offer, reputations.get(offer.provider_node_id, UNSCORED))
         ]
+
+    def reputations(self) -> dict[str, float]:
+        if self.store is None:
+            return {}
+        from relay.reputation import reputations as current
+
+        return current(self.store)
 
     def latency_by_provider(self, at: datetime | None = None) -> dict[str, float]:
         """Mean recent latency per provider, from what consumers actually saw."""
