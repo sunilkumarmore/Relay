@@ -291,6 +291,58 @@ class Store(Protocol):
 
     def reset_session(self, session_id: str) -> None: ...
 
+    # -- tasks (distributed task dispatch) --------------------------------
+
+    def enqueue_task(self, task: dict[str, Any]) -> None: ...
+
+    def get_task(self, task_id: str) -> dict[str, Any] | None: ...
+
+    def list_tasks(
+        self,
+        *,
+        job_id: str | None = None,
+        status: str | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]: ...
+
+    def claimable_tasks(
+        self, *, task_types: list[str], now_iso_ts: str, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """Queued, unexpired tasks of these types, oldest first.
+
+        Candidates only. Two providers can be handed the same candidate and
+        exactly one of them wins the `compare_and_set_task` that follows.
+        """
+        ...
+
+    def compare_and_set_task(
+        self,
+        task_id: str,
+        *,
+        expect_status: str,
+        expect_lease_holder: str | None = None,
+        updates: dict[str, Any],
+    ) -> bool:
+        """Apply `updates` only if the row still looks as expected.
+
+        Returns whether it applied. This is the one primitive the lease
+        mechanism needs: claiming, renewing, completing and reaping are all a
+        conditional write against the state the caller last observed.
+        """
+        ...
+
+    def expired_leases(self, now_iso_ts: str, limit: int = 200) -> list[dict[str, Any]]: ...
+
+    def insert_task_result(self, result: dict[str, Any]) -> None: ...
+
+    def list_task_results(
+        self, *, task_id: str | None = None, job_id: str | None = None, limit: int = 500
+    ) -> list[dict[str, Any]]: ...
+
+    def put_operand(self, operand_hash: str, payload: dict[str, Any]) -> None: ...
+
+    def get_operand(self, operand_hash: str) -> dict[str, Any] | None: ...
+
 
 class SupabaseStore:
     """Store backed by the ``relay_*`` tables in a Supabase project.
@@ -909,6 +961,108 @@ class SupabaseStore:
         ):
             self._db().table(table).delete().eq("session_id", session_id).execute()
 
+    # -- tasks ------------------------------------------------------------
+
+    def enqueue_task(self, task: dict[str, Any]) -> None:
+        self._db().table("relay_tasks").upsert(task, on_conflict="task_id").execute()
+
+    def get_task(self, task_id: str) -> dict[str, Any] | None:
+        res = self._db().table("relay_tasks").select("*").eq("task_id", task_id).limit(1).execute()
+        rows = res.data or []
+        return dict(rows[0]) if rows else None
+
+    def list_tasks(
+        self,
+        *,
+        job_id: str | None = None,
+        status: str | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        query = self._db().table("relay_tasks").select("*")
+        if job_id is not None:
+            query = query.eq("job_id", job_id)
+        if status is not None:
+            query = query.eq("status", status)
+        res = query.order("created_at").limit(limit).execute()
+        return [dict(row) for row in (res.data or [])]
+
+    def claimable_tasks(
+        self, *, task_types: list[str], now_iso_ts: str, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        if not task_types:
+            return []
+        res = (
+            self._db()
+            .table("relay_tasks")
+            .select("*")
+            .eq("status", "queued")
+            .in_("task_type", task_types)
+            .gt("expires_at", now_iso_ts)
+            .order("created_at")
+            .limit(limit)
+            .execute()
+        )
+        return [dict(row) for row in (res.data or [])]
+
+    def compare_and_set_task(
+        self,
+        task_id: str,
+        *,
+        expect_status: str,
+        expect_lease_holder: str | None = None,
+        updates: dict[str, Any],
+    ) -> bool:
+        query = self._db().table("relay_tasks").update(updates).eq("task_id", task_id)
+        query = query.eq("status", expect_status)
+        if expect_lease_holder is not None:
+            query = query.eq("lease_holder", expect_lease_holder)
+        res = query.execute()
+        return bool(res.data)
+
+    def expired_leases(self, now_iso_ts: str, limit: int = 200) -> list[dict[str, Any]]:
+        res = (
+            self._db()
+            .table("relay_tasks")
+            .select("*")
+            .eq("status", "leased")
+            .lte("lease_expires_at", now_iso_ts)
+            .limit(limit)
+            .execute()
+        )
+        return [dict(row) for row in (res.data or [])]
+
+    def insert_task_result(self, result: dict[str, Any]) -> None:
+        self._db().table("relay_task_results").insert(result).execute()
+
+    def list_task_results(
+        self, *, task_id: str | None = None, job_id: str | None = None, limit: int = 500
+    ) -> list[dict[str, Any]]:
+        query = self._db().table("relay_task_results").select("*")
+        if task_id is not None:
+            query = query.eq("task_id", task_id)
+        if job_id is not None:
+            query = query.eq("job_id", job_id)
+        res = query.order("finished_at").limit(limit).execute()
+        return [dict(row) for row in (res.data or [])]
+
+    def put_operand(self, operand_hash: str, payload: dict[str, Any]) -> None:
+        self._db().table("relay_operands").upsert(
+            {"operand_hash": operand_hash, "payload": payload, "created_at": now_iso()},
+            on_conflict="operand_hash",
+        ).execute()
+
+    def get_operand(self, operand_hash: str) -> dict[str, Any] | None:
+        res = (
+            self._db()
+            .table("relay_operands")
+            .select("*")
+            .eq("operand_hash", operand_hash)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        return dict(rows[0]) if rows else None
+
 
 TABLES = (
     "sessions",
@@ -928,6 +1082,9 @@ TABLES = (
     "reputation",
     "disputes",
     "agent_state",
+    "tasks",
+    "task_results",
+    "operands",
 )
 
 
@@ -1569,6 +1726,113 @@ class MemoryStore:
                     for r in self.tables[name]
                     if r.get("session_id") != session_id and r.get("job_id") != session_id
                 ]
+
+    # -- tasks ------------------------------------------------------------
+
+    def enqueue_task(self, task: dict[str, Any]) -> None:
+        with self._txn():
+            for index, row in enumerate(self.tables["tasks"]):
+                if row["task_id"] == task["task_id"]:
+                    self.tables["tasks"][index] = dict(task)
+                    return
+            self.tables["tasks"].append(dict(task))
+
+    def get_task(self, task_id: str) -> dict[str, Any] | None:
+        for row in self._view()["tasks"]:
+            if row["task_id"] == task_id:
+                return dict(row)
+        return None
+
+    def list_tasks(
+        self,
+        *,
+        job_id: str | None = None,
+        status: str | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        rows = [
+            dict(r)
+            for r in self._view()["tasks"]
+            if (job_id is None or r.get("job_id") == job_id)
+            and (status is None or r.get("status") == status)
+        ]
+        rows.sort(key=lambda r: str(r.get("created_at", "")))
+        return rows[:limit]
+
+    def claimable_tasks(
+        self, *, task_types: list[str], now_iso_ts: str, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        if not task_types:
+            return []
+        wanted = set(task_types)
+        rows = [
+            dict(r)
+            for r in self._view()["tasks"]
+            if r.get("status") == "queued"
+            and r.get("task_type") in wanted
+            and str(r.get("expires_at") or "") > now_iso_ts
+        ]
+        rows.sort(key=lambda r: str(r.get("created_at", "")))
+        return rows[:limit]
+
+    def compare_and_set_task(
+        self,
+        task_id: str,
+        *,
+        expect_status: str,
+        expect_lease_holder: str | None = None,
+        updates: dict[str, Any],
+    ) -> bool:
+        with self._txn():
+            for row in self.tables["tasks"]:
+                if row["task_id"] != task_id:
+                    continue
+                if row.get("status") != expect_status:
+                    return False
+                if expect_lease_holder is not None and row.get("lease_holder") != expect_lease_holder:
+                    return False
+                row.update(updates)
+                return True
+        return False
+
+    def expired_leases(self, now_iso_ts: str, limit: int = 200) -> list[dict[str, Any]]:
+        rows = [
+            dict(r)
+            for r in self._view()["tasks"]
+            if r.get("status") == "leased" and str(r.get("lease_expires_at") or "") <= now_iso_ts
+        ]
+        return rows[:limit]
+
+    def insert_task_result(self, result: dict[str, Any]) -> None:
+        with self._txn():
+            self.tables["task_results"].append(dict(result))
+
+    def list_task_results(
+        self, *, task_id: str | None = None, job_id: str | None = None, limit: int = 500
+    ) -> list[dict[str, Any]]:
+        rows = [
+            dict(r)
+            for r in self._view()["task_results"]
+            if (task_id is None or r.get("task_id") == task_id)
+            and (job_id is None or r.get("job_id") == job_id)
+        ]
+        rows.sort(key=lambda r: str(r.get("finished_at", "")))
+        return rows[:limit]
+
+    def put_operand(self, operand_hash: str, payload: dict[str, Any]) -> None:
+        with self._txn():
+            for row in self.tables["operands"]:
+                if row["operand_hash"] == operand_hash:
+                    return
+            self.tables["operands"].append(
+                {"operand_hash": operand_hash, "payload": payload, "created_at": now_iso()}
+            )
+
+    def get_operand(self, operand_hash: str) -> dict[str, Any] | None:
+        for row in self._view()["operands"]:
+            if row["operand_hash"] == operand_hash:
+                return dict(row)
+        return None
 
 
 class FileStore(MemoryStore):
