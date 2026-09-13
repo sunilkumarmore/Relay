@@ -178,7 +178,10 @@ class TaskQueue:
         now = at or now_utc()
         now_iso = now.isoformat()
         candidates = self.store.claimable_tasks(
-            task_types=task_types, now_iso_ts=now_iso, limit=MAX_CLAIM_ATTEMPTS
+            task_types=task_types,
+            now_iso_ts=now_iso,
+            limit=MAX_CLAIM_ATTEMPTS,
+            exclude_for=provider_node_id,
         )
         for row in candidates:
             task = Task.from_row(row)

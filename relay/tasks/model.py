@@ -121,6 +121,11 @@ class Task(BaseModel):
     lease_expires_at: str = ""
     completed_by: str = ""
     output_hash: str = ""
+    # An audit copy must not be answered by the node whose work it is checking.
+    # Advisory in `claimable_tasks` (so pollers skip it cheaply) and enforced in
+    # the store's compare-and-set, which is what a dishonest client cannot skip.
+    excluded_provider: str = ""
+    audit_of: str = ""
     last_error: str = ""
     updated_at: str = ""
 

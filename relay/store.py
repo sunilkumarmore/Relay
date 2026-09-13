@@ -306,12 +306,21 @@ class Store(Protocol):
     ) -> list[dict[str, Any]]: ...
 
     def claimable_tasks(
-        self, *, task_types: list[str], now_iso_ts: str, limit: int = 20
+        self,
+        *,
+        task_types: list[str],
+        now_iso_ts: str,
+        limit: int = 20,
+        exclude_for: str = "",
     ) -> list[dict[str, Any]]:
         """Queued, unexpired tasks of these types, oldest first.
 
         Candidates only. Two providers can be handed the same candidate and
         exactly one of them wins the `compare_and_set_task` that follows.
+
+        `exclude_for` drops tasks this node is barred from — an audit of its own
+        earlier answer. That is a filter, not a defence; the defence is that
+        `compare_and_set_task` refuses to hand the lease to the excluded node.
         """
         ...
 
@@ -987,21 +996,26 @@ class SupabaseStore:
         return [dict(row) for row in (res.data or [])]
 
     def claimable_tasks(
-        self, *, task_types: list[str], now_iso_ts: str, limit: int = 20
+        self,
+        *,
+        task_types: list[str],
+        now_iso_ts: str,
+        limit: int = 20,
+        exclude_for: str = "",
     ) -> list[dict[str, Any]]:
         if not task_types:
             return []
-        res = (
+        query = (
             self._db()
             .table("relay_tasks")
             .select("*")
             .eq("status", "queued")
             .in_("task_type", task_types)
             .gt("expires_at", now_iso_ts)
-            .order("created_at")
-            .limit(limit)
-            .execute()
         )
+        if exclude_for:
+            query = query.neq("excluded_provider", exclude_for)
+        res = query.order("created_at").limit(limit).execute()
         return [dict(row) for row in (res.data or [])]
 
     def compare_and_set_task(
@@ -1016,6 +1030,11 @@ class SupabaseStore:
         query = query.eq("status", expect_status)
         if expect_lease_holder is not None:
             query = query.eq("lease_holder", expect_lease_holder)
+        taking = str(updates.get("lease_holder") or "")
+        if taking:
+            # Migration 010 says the same thing in the row-level policy, which
+            # is the half a dishonest client cannot route around.
+            query = query.neq("excluded_provider", taking)
         res = query.execute()
         return bool(res.data)
 
@@ -1760,7 +1779,12 @@ class MemoryStore:
         return rows[:limit]
 
     def claimable_tasks(
-        self, *, task_types: list[str], now_iso_ts: str, limit: int = 20
+        self,
+        *,
+        task_types: list[str],
+        now_iso_ts: str,
+        limit: int = 20,
+        exclude_for: str = "",
     ) -> list[dict[str, Any]]:
         if not task_types:
             return []
@@ -1771,6 +1795,7 @@ class MemoryStore:
             if r.get("status") == "queued"
             and r.get("task_type") in wanted
             and str(r.get("expires_at") or "") > now_iso_ts
+            and not (exclude_for and r.get("excluded_provider") == exclude_for)
         ]
         rows.sort(key=lambda r: str(r.get("created_at", "")))
         return rows[:limit]
@@ -1790,6 +1815,9 @@ class MemoryStore:
                 if row.get("status") != expect_status:
                     return False
                 if expect_lease_holder is not None and row.get("lease_holder") != expect_lease_holder:
+                    return False
+                taking = str(updates.get("lease_holder") or "")
+                if taking and row.get("excluded_provider") == taking:
                     return False
                 row.update(updates)
                 return True

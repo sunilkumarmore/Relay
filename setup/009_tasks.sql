@@ -101,7 +101,15 @@ CREATE TABLE IF NOT EXISTS relay_tasks (
   completed_by      TEXT NOT NULL DEFAULT '',
   output_hash       TEXT NOT NULL DEFAULT '',
   last_error        TEXT NOT NULL DEFAULT '',
-  updated_at        TEXT NOT NULL DEFAULT ''
+  updated_at        TEXT NOT NULL DEFAULT '',
+
+  -- Verification. An audit is the same work queued again and barred to the node
+  -- whose answer it is checking, because a check the accused may answer is not
+  -- one. `excluded_provider` is filtered client-side so pollers skip it cheaply
+  -- and enforced in the update policy below, which is the half a dishonest
+  -- client cannot route around.
+  audit_of          TEXT NOT NULL DEFAULT '',
+  excluded_provider TEXT NOT NULL DEFAULT ''
 );
 
 -- The claim query: queued work of a type I can run, oldest first. This is the
@@ -181,9 +189,13 @@ CREATE POLICY relay_tasks_update ON relay_tasks
     OR (status = 'leased' AND lease_expires_at <> '' AND lease_expires_at <= to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"+00:00"'))
   )
   WITH CHECK (
-    consumer_node_id = relay_current_node()
-    OR lease_holder = relay_current_node()
-    OR lease_holder = ''
+    -- Nobody takes a lease on an audit of their own work, whatever else is true.
+    (lease_holder = '' OR excluded_provider = '' OR lease_holder <> excluded_provider)
+    AND (
+      consumer_node_id = relay_current_node()
+      OR lease_holder = relay_current_node()
+      OR lease_holder = ''
+    )
   );
 
 DROP POLICY IF EXISTS relay_tasks_delete ON relay_tasks;
