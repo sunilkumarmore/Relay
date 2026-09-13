@@ -81,66 +81,87 @@ def _positive_int(value: Any, label: str) -> int:
 
 
 class MatmulBlock:
-    """One horizontal slice of C = A @ B.
+    """One tile of C = A @ B.
 
-    The task carries its own rows of A inline — they are small, and they differ
-    per task so there would be nothing to share. B is referenced by hash,
-    because every block of the job needs all of it and a provider should fetch
-    it once for the whole job rather than once per task.
+    Both operands are referenced by hash rather than carried in the payload, and
+    that is what makes a large job possible at all. A 4200x4200 matrix is 141MB
+    of float64; carried inline it would be re-sent with every task that touches
+    it, which for a job tiled 160 x 30 means hundreds of gigabytes of the same
+    numbers. Referenced by hash, each row strip of A and each column strip of B
+    travels once per device and is cached there.
+
+    Tiling in two dimensions rather than one is for the same reason. Splitting
+    only by rows means every task needs the whole of B, so the smallest unit of
+    data a device must hold is the entire right operand. Splitting both ways
+    bounds it: a device holds one strip of each.
     """
 
     name = MATMUL_BLOCK
     deterministic = True
 
     def work_units(self, payload: dict[str, Any]) -> int:
-        a = _require(payload, "a_block")
-        rows = _positive_int(a.get("rows"), "a_block.rows")
-        inner = _positive_int(a.get("cols"), "a_block.cols")
+        rows = _positive_int(_require(payload, "a_rows"), "a_rows")
+        inner = _positive_int(_require(payload, "a_cols"), "a_cols")
         cols = _positive_int(_require(payload, "b_cols"), "b_cols")
         return rows * inner * cols
 
     def validate(self, payload: dict[str, Any]) -> None:
-        a = Matrix.from_payload(_require(payload, "a_block"))
-        b_cols = _positive_int(_require(payload, "b_cols"), "b_cols")
-        b_hash = str(_require(payload, "b_hash"))
-        if len(b_hash) != 64:
-            raise TaskError("b_hash is not a sha256 digest")
+        for key in ("a_hash", "b_hash"):
+            digest = str(_require(payload, key))
+            if len(digest) != 64:
+                raise TaskError(f"{key} is not a sha256 digest")
+        rows = _positive_int(_require(payload, "a_rows"), "a_rows")
+        inner = _positive_int(_require(payload, "a_cols"), "a_cols")
+        b_rows = _positive_int(_require(payload, "b_rows"), "b_rows")
+        cols = _positive_int(_require(payload, "b_cols"), "b_cols")
         _positive_int(_require(payload, "row_offset"), "row_offset")
-        if a.cols == 0 and b_cols:
-            raise TaskError("a_block has no columns to multiply against B")
+        _positive_int(_require(payload, "col_offset"), "col_offset")
+        if inner != b_rows:
+            raise TaskError(f"cannot multiply {rows}x{inner} by {b_rows}x{cols}")
 
     def run(self, payload: dict[str, Any], resolve: Resolver) -> dict[str, Any]:
         self.validate(payload)
-        a = Matrix.from_payload(payload["a_block"])
+        a = resolve(str(payload["a_hash"]))
         b = resolve(str(payload["b_hash"]))
-        b_cols = int(payload["b_cols"])
 
-        if b.rows != a.cols:
+        # The operands were fetched by hash, so these can only disagree if the
+        # task itself is inconsistent with what it asked for.
+        if (a.rows, a.cols) != (int(payload["a_rows"]), int(payload["a_cols"])):
+            raise TaskError(
+                f"a_hash resolves to {a.rows}x{a.cols}, task declares "
+                f"{payload['a_rows']}x{payload['a_cols']}"
+            )
+        if (b.rows, b.cols) != (int(payload["b_rows"]), int(payload["b_cols"])):
+            raise TaskError(
+                f"b_hash resolves to {b.rows}x{b.cols}, task declares "
+                f"{payload['b_rows']}x{payload['b_cols']}"
+            )
+        if a.cols != b.rows:
             raise TaskError(f"cannot multiply {a.rows}x{a.cols} by {b.rows}x{b.cols}")
-        if b.cols != b_cols:
-            raise TaskError(f"b_hash resolves to {b.cols} columns, task declares {b_cols}")
 
         # Accumulation is k-ascending for every element of the result, on every
         # machine. That fixed order is the whole basis of the determinism claim
         # above — do not reorder these loops for speed without also setting
         # deterministic = False.
+        width = b.cols
         b_rows = [list(b.row(k)) for k in range(b.rows)]
         out: list[float] = []
         for i in range(a.rows):
             a_row = a.row(i)
-            acc = [0.0] * b_cols
+            acc = [0.0] * width
             for k in range(a.cols):
                 scale = a_row[k]
                 b_row = b_rows[k]
                 acc = [c + scale * v for c, v in zip(acc, b_row, strict=True)]
             out.extend(acc)
 
-        block = Matrix(rows=a.rows, cols=b_cols, data=array("d", out))
+        block = Matrix(rows=a.rows, cols=width, data=array("d", out))
         return {
             "c_block": block.to_payload(),
             "row_offset": int(payload["row_offset"]),
+            "col_offset": int(payload["col_offset"]),
             "rows": a.rows,
-            "cols": b_cols,
+            "cols": width,
         }
 
 

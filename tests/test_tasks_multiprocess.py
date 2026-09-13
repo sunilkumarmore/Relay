@@ -40,6 +40,7 @@ LEASE_SLACK = 2
 # and the whole job is a couple of seconds of real arithmetic.
 ROWS, INNER, COLS = 120, 300, 300
 BLOCK_ROWS = 10
+BLOCK_COLS = 150
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -101,10 +102,11 @@ def test_a_killed_device_does_not_cost_the_job(tmp_path: Path) -> None:
         a=a,
         b=b,
         block_rows=BLOCK_ROWS,
+        block_cols=BLOCK_COLS,
         max_seconds=MAX_TASK_SECONDS,
         ttl_seconds=600,
     )
-    assert len(job.task_ids) == ROWS // BLOCK_ROWS
+    assert len(job.task_ids) == (ROWS // BLOCK_ROWS) * (COLS // BLOCK_COLS)
 
     # Knowing the victim's node id in advance is what makes the assertions
     # specific: we can name the task it was holding when it died.
@@ -173,7 +175,7 @@ def test_the_demo_command_works(tmp_path: Path) -> None:
         [
             sys.executable, "-m", "relay.tasks", "demo",
             "--rows", "40", "--inner", "20", "--cols", "20",
-            "--block-rows", "10", "--devices", "3",
+            "--block-rows", "10", "--block-cols", "10", "--devices", "3",
         ],
         capture_output=True,
         text=True,

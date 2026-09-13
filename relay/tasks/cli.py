@@ -72,6 +72,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
         b=b,
         job_id=args.job_id,
         block_rows=args.block_rows,
+        block_cols=args.block_cols,
         max_seconds=args.max_seconds,
     )
     print(f"job {job.job_id}")
@@ -87,7 +88,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     job = matmul.load_job(store, args.job_id)
     state = matmul.progress(store, job)
     print(f"job {job.job_id}: {job.describe()}")
-    print(f"  {state['completed']}/{state['blocks']} blocks ({state['percent']}%)")
+    print(f"  {state['completed']}/{state['blocks']} tiles ({state['percent']}%)")
     for status, count in sorted(state["by_status"].items()):
         print(f"    {status:<10} {count}")
     workers = {
@@ -110,12 +111,12 @@ def cmd_collect(args: argparse.Namespace) -> int:
             break
         if time.monotonic() >= deadline:
             print(
-                f"Still {state['blocks'] - state['completed']} block(s) outstanding after "
+                f"Still {state['blocks'] - state['completed']} tile(s) outstanding after "
                 f"{args.wait}s. Not assembling a partial answer.",
                 file=sys.stderr,
             )
             return 1
-        print(f"  {state['completed']}/{state['blocks']} blocks…", flush=True)
+        print(f"  {state['completed']}/{state['blocks']} tiles…", flush=True)
         time.sleep(args.poll)
 
     result = matmul.assemble(store, job)
@@ -163,7 +164,13 @@ def cmd_demo(args: argparse.Namespace) -> int:
 
     print(f"\nOrdering a {args.rows}x{args.inner} @ {args.inner}x{args.cols} multiplication")
     job = matmul.submit_matmul(
-        queue, consumer, a=a, b=b, block_rows=args.block_rows, max_seconds=args.max_seconds
+        queue,
+        consumer,
+        a=a,
+        b=b,
+        block_rows=args.block_rows,
+        block_cols=args.block_cols,
+        max_seconds=args.max_seconds,
     )
     print(f"  {job.describe()}\n")
 
@@ -183,7 +190,7 @@ def cmd_demo(args: argparse.Namespace) -> int:
             for _ in range(min(args.kill_after, len(job.task_ids)))
         ]
         held = [t for t in held if t is not None]
-        print(f"\n  {names[-1]} takes {len(held)} block(s) and is then unplugged mid-job.")
+        print(f"\n  {names[-1]} takes {len(held)} tile(s) and is then unplugged mid-job.")
 
     started = time.monotonic()
     completed_by: dict[str, int] = {}
@@ -210,7 +217,7 @@ def cmd_demo(args: argparse.Namespace) -> int:
 
     drain()
     state = matmul.progress(store, job)
-    print(f"\n  {state['completed']}/{state['blocks']} blocks done by the surviving devices")
+    print(f"\n  {state['completed']}/{state['blocks']} tiles done by the surviving devices")
 
     if held:
         try:
@@ -232,7 +239,7 @@ def cmd_demo(args: argparse.Namespace) -> int:
 
     print(f"\n  assembled {result.rows}x{result.cols} in {elapsed:.1f}s")
     for name, count in sorted(completed_by.items()):
-        print(f"    {name}: {count} block(s)")
+        print(f"    {name}: {count} tile(s)")
     print(f"\n  bit-identical to the single-machine answer: {exact}")
     print(f"  queue counters: {queue.stats()}")
     return 0 if exact else 1
@@ -251,7 +258,8 @@ def build_parser() -> argparse.ArgumentParser:
         target.add_argument("--inner", type=int, default=240, help="columns of A / rows of B")
         target.add_argument("--cols", type=int, default=240, help="columns of B")
         target.add_argument("--seed", type=int, default=1)
-        target.add_argument("--block-rows", type=int, default=None)
+        target.add_argument("--block-rows", type=int, default=None, help="rows of A per tile")
+        target.add_argument("--block-cols", type=int, default=None, help="columns of B per tile")
         target.add_argument("--max-seconds", type=int, default=300)
         target.add_argument("--lease-seconds", type=int, default=DEFAULT_LEASE_SECONDS)
 
@@ -278,11 +286,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     demo = sub.add_parser("demo", help="the whole thing in one process")
     add_shape(demo)
-    demo.set_defaults(rows=120, inner=60, cols=60, block_rows=20)
+    demo.set_defaults(rows=120, inner=60, cols=60, block_rows=20, block_cols=30)
     demo.add_argument("--devices", type=int, default=3)
     demo.add_argument("--kill-one", action="store_true", default=True)
     demo.add_argument("--no-kill", dest="kill_one", action="store_false")
-    demo.add_argument("--kill-after", type=int, default=2, help="blocks the doomed device takes")
+    demo.add_argument("--kill-after", type=int, default=2, help="tiles the doomed device takes")
     demo.set_defaults(func=cmd_demo)
 
     return parser

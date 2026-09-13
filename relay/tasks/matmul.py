@@ -1,26 +1,37 @@
 """Splitting a matrix multiplication across machines, and putting it back.
 
-C = A @ B divides along the rows of A. Row *i* of C depends on row *i* of A and
-on all of B, and on nothing else — no block needs any other block's answer. That
-independence is what makes the work distributable at all, and it is why this is
-the honest demonstration of the idea rather than a contrived one: there is no
-coordination between providers, no partial state to migrate, and a block that
+C = A @ B divides into a grid of tiles. Tile *(i, j)* needs row strip *i* of A
+and column strip *j* of B, and nothing else — no tile needs any other tile's
+answer. That independence is what makes the work distributable at all, and it is
+why this is an honest demonstration rather than a contrived one: there is no
+coordination between providers, no partial state to migrate, and a tile that
 comes back late or twice costs nothing but the duplicate effort.
 
-B is published once as a content-addressed operand and referenced by hash. The
-rows of A ride inside their own task, because they differ per task and there
-would be nothing to share.
+## Why both dimensions
 
-## Choosing a block size
+Splitting only by rows is simpler, and it does not scale. Every task would need
+the whole of B, so the smallest amount of data a device must hold and fetch is
+the entire right operand — 141MB of float64 for the 4200x4200 job that takes an
+hour on one core. Splitting both ways bounds it: a device holds one strip of
+each, and the strips are sized to fit comfortably through a database row.
 
-Larger blocks amortise the per-task overhead; smaller blocks recover faster from
-a dead provider, because a lost lease loses one block's work. Since a phone may
-vanish mid-job while a desktop will not, this leans small. `suggest_block_rows`
-picks a size that keeps each block inside its deadline given a measured rate.
+Every strip is a content-addressed operand, published once and referenced by
+hash. A strip of A is reused by every tile in its row, a strip of B by every
+tile in its column, and a device that has fetched one keeps it. Carrying them
+inline instead would re-send the same numbers once per tile — hundreds of
+gigabytes for a job that is only 282MB of actual operand.
+
+## Choosing tile sizes
+
+Larger tiles amortise per-task overhead; smaller tiles recover faster from a
+dead provider, since a lost lease loses one tile's work, and keep each operand
+strip small enough to move. A phone may vanish mid-job where a desktop will not,
+so this leans small.
 """
 
 from __future__ import annotations
 
+import math
 import uuid
 from array import array
 from dataclasses import dataclass, field
@@ -34,9 +45,25 @@ from relay.tasks.model import STATUS_COMPLETED, Task, TaskResult
 from relay.tasks.operands import Matrix, OperandError
 from relay.tasks.queue import TaskQueue
 
-# A conservative floor for pure-Python multiply-accumulates per second. Used
-# only to pick a block size; being wrong makes blocks the wrong size, not wrong.
-ASSUMED_UNITS_PER_SECOND = 2_000_000
+# Multiply-accumulates per second, measured at ~20M on a modern laptop core for
+# strips a few hundred wide. Deliberately set well below that: underestimating
+# makes tiles smaller, which costs a little overhead and buys faster recovery
+# and better balance across a fleet of unequal devices. Overestimating makes
+# tiles that overrun their deadline on the slowest device, which costs the work
+# twice. Being wrong here makes tiles the wrong size, never the answer wrong.
+ASSUMED_UNITS_PER_SECOND = 8_000_000
+
+# Ceiling on one operand strip, in bytes before base64. Strips travel as a
+# database row and have to sit in a phone's memory alongside the result.
+MAX_STRIP_BYTES = 4 * 1024 * 1024
+
+# What one tile should be worth, at the assumed rate. Sizing to a target
+# duration rather than to a fraction of the deadline is what keeps a fleet
+# balanced: a job cut into a handful of large tiles leaves most devices idle
+# and, worse, finishes no faster than its slowest member. Small enough that
+# losing one to a dead device is a rounding error; large enough that the
+# per-task round trip is a small share of it.
+TARGET_TILE_SECONDS = 5
 
 
 class AssemblyError(RuntimeError):
@@ -49,8 +76,8 @@ class MatmulJob:
     rows: int
     inner: int
     cols: int
-    b_hash: str
     block_rows: int
+    block_cols: int
     task_ids: list[str] = field(default_factory=list)
 
     @property
@@ -58,25 +85,76 @@ class MatmulJob:
         return self.rows * self.inner * self.cols
 
     def describe(self) -> str:
+        down = math.ceil(self.rows / max(1, self.block_rows))
+        across = math.ceil(self.cols / max(1, self.block_cols))
         return (
             f"{self.rows}x{self.inner} @ {self.inner}x{self.cols} "
             f"= {self.total_work_units:,} multiply-accumulates "
-            f"in {len(self.task_ids)} blocks of {self.block_rows} rows"
+            f"in {down}x{across} tiles of {self.block_rows}x{self.block_cols}"
         )
 
 
 def suggest_block_rows(
-    *, inner: int, cols: int, max_seconds: int, units_per_second: int = ASSUMED_UNITS_PER_SECOND
+    *,
+    inner: int,
+    cols: int,
+    max_seconds: int,
+    units_per_second: int = ASSUMED_UNITS_PER_SECOND,
+    max_strip_bytes: int = MAX_STRIP_BYTES,
 ) -> int:
-    """How many rows of A fit comfortably inside one task's deadline.
+    """How many rows of A fit comfortably inside one task's deadline *and* one
+    operand strip.
 
-    Aims at a quarter of the deadline rather than all of it. A block that only
-    just fits on the machine it was sized for will overrun on a slower one, and
-    an overrun means a lapsed lease and the work done twice.
+    Three ceilings, and the lowest wins.
+
+    The target one sizes a tile at `TARGET_TILE_SECONDS` of assumed work, which
+    is what spreads a job across a fleet instead of handing it to one machine.
+
+    The deadline one is a backstop: never more than a quarter of the time the
+    task allows, because a tile that only just fits on the machine it was sized
+    for will overrun on a slower one, and an overrun means a lapsed lease and
+    the work done twice.
+
+    The byte one exists because time says nothing about size. At inner=4200 a
+    tile sized purely by the clock would want a 38MB strip of A, which is not
+    something to push through a database row or hold on a phone.
     """
-    per_row = max(1, inner * cols)
-    budget_units = max(1, (units_per_second * max_seconds) // 4)
-    return max(1, min(4096, budget_units // per_row))
+    per_row_units = max(1, inner * cols)
+    by_target = max(1, units_per_second * TARGET_TILE_SECONDS) // per_row_units
+    by_deadline = max(1, (units_per_second * max_seconds) // 4) // per_row_units
+
+    per_row_bytes = max(1, inner * 8)
+    by_size = max_strip_bytes // per_row_bytes
+
+    return max(1, min(4096, by_target, by_deadline, by_size))
+
+
+def suggest_block_cols(*, inner: int, max_strip_bytes: int = MAX_STRIP_BYTES) -> int:
+    """How many columns of B fit in one operand strip.
+
+    Bounded by bytes rather than by arithmetic: a strip is `inner x block_cols`
+    float64, and it has to travel through a database row and sit in a phone's
+    memory.
+    """
+    per_col = max(1, inner * 8)
+    return max(1, max_strip_bytes // per_col)
+
+
+def _row_strip(matrix: Matrix, offset: int, height: int) -> Matrix:
+    start = offset * matrix.cols
+    return Matrix(
+        rows=height,
+        cols=matrix.cols,
+        data=array("d", matrix.data[start : start + height * matrix.cols]),
+    )
+
+
+def _col_strip(matrix: Matrix, offset: int, width: int) -> Matrix:
+    data = array("d")
+    for row in range(matrix.rows):
+        start = row * matrix.cols + offset
+        data.extend(matrix.data[start : start + width])
+    return Matrix(rows=matrix.rows, cols=width, data=data)
 
 
 def submit_matmul(
@@ -87,52 +165,70 @@ def submit_matmul(
     b: Matrix,
     job_id: str | None = None,
     block_rows: int | None = None,
+    block_cols: int | None = None,
     max_seconds: int = task_model.DEFAULT_MAX_SECONDS,
     max_price_credits: float = 0.0,
     max_attempts: int = task_model.DEFAULT_MAX_ATTEMPTS,
     ttl_seconds: int = task_model.DEFAULT_TASK_TTL_SECONDS,
 ) -> MatmulJob:
-    """Publish B, cut A into row blocks, sign and queue each one."""
+    """Publish the operand strips, then sign and queue one task per tile."""
     if a.cols != b.rows:
         raise ValueError(f"cannot multiply {a.rows}x{a.cols} by {b.rows}x{b.cols}")
 
+    width = block_cols or suggest_block_cols(inner=a.cols)
+    height = block_rows or suggest_block_rows(
+        inner=a.cols, cols=min(width, b.cols), max_seconds=max_seconds
+    )
     job = MatmulJob(
         job_id=job_id or str(uuid.uuid4()),
         rows=a.rows,
         inner=a.cols,
         cols=b.cols,
-        b_hash=b.digest(),
-        block_rows=block_rows
-        or suggest_block_rows(inner=a.cols, cols=b.cols, max_seconds=max_seconds),
+        block_rows=height,
+        block_cols=width,
     )
 
-    queue.store.put_operand(job.b_hash, b.to_payload())
+    # Publish each strip once. A row strip of A is reused by every tile across
+    # its row, a column strip of B by every tile down its column.
+    row_strips: list[tuple[int, str, int]] = []
+    for offset in range(0, a.rows, height):
+        rows = min(height, a.rows - offset)
+        strip = _row_strip(a, offset, rows)
+        digest = strip.digest()
+        queue.store.put_operand(digest, strip.to_payload())
+        row_strips.append((offset, digest, rows))
 
-    for offset in range(0, a.rows, job.block_rows):
-        height = min(job.block_rows, a.rows - offset)
-        start = offset * a.cols
-        block = Matrix(
-            rows=height,
-            cols=a.cols,
-            data=array("d", a.data[start : start + height * a.cols]),
-        )
-        task = task_model.build_task(
-            identity,
-            job_id=job.job_id,
-            task_type=kernels.MATMUL_BLOCK,
-            payload={
-                "a_block": block.to_payload(),
-                "b_hash": job.b_hash,
-                "b_cols": b.cols,
-                "row_offset": offset,
-            },
-            max_seconds=max_seconds,
-            max_price_credits=max_price_credits,
-            max_attempts=max_attempts,
-            ttl_seconds=ttl_seconds,
-        )
-        queue.submit(task)
-        job.task_ids.append(task.task_id)
+    col_strips: list[tuple[int, str, int]] = []
+    for offset in range(0, b.cols, width):
+        cols = min(width, b.cols - offset)
+        strip = _col_strip(b, offset, cols)
+        digest = strip.digest()
+        queue.store.put_operand(digest, strip.to_payload())
+        col_strips.append((offset, digest, cols))
+
+    for row_offset, a_hash, rows in row_strips:
+        for col_offset, b_hash, cols in col_strips:
+            task = task_model.build_task(
+                identity,
+                job_id=job.job_id,
+                task_type=kernels.MATMUL_BLOCK,
+                payload={
+                    "a_hash": a_hash,
+                    "a_rows": rows,
+                    "a_cols": a.cols,
+                    "b_hash": b_hash,
+                    "b_rows": b.rows,
+                    "b_cols": cols,
+                    "row_offset": row_offset,
+                    "col_offset": col_offset,
+                },
+                max_seconds=max_seconds,
+                max_price_credits=max_price_credits,
+                max_attempts=max_attempts,
+                ttl_seconds=ttl_seconds,
+            )
+            queue.submit(task)
+            job.task_ids.append(task.task_id)
 
     return job
 
@@ -169,36 +265,42 @@ def assemble(store: Store, job: MatmulJob) -> Matrix:
     """
     results = _accepted_results(store, job)
     data = array("d", bytes(job.rows * job.cols * 8))
-    covered = bytearray(job.rows)
+    covered = bytearray(job.rows * job.cols)
 
     for result in results.values():
         payload = result.output.get("c_block")
         if payload is None:
-            raise AssemblyError(f"result for {result.task_id} carries no block")
+            raise AssemblyError(f"result for {result.task_id} carries no tile")
         try:
-            block = Matrix.from_payload(payload)
+            tile = Matrix.from_payload(payload)
         except OperandError as exc:
             raise AssemblyError(f"result for {result.task_id} is malformed: {exc}") from exc
-        offset = int(result.output.get("row_offset", -1))
-        if offset < 0 or offset + block.rows > job.rows:
+        row_offset = int(result.output.get("row_offset", -1))
+        col_offset = int(result.output.get("col_offset", -1))
+        if row_offset < 0 or row_offset + tile.rows > job.rows:
             raise AssemblyError(
-                f"block at row {offset} of height {block.rows} does not fit a "
+                f"tile at row {row_offset} of height {tile.rows} does not fit a "
                 f"{job.rows}-row result"
             )
-        if block.cols != job.cols:
+        if col_offset < 0 or col_offset + tile.cols > job.cols:
             raise AssemblyError(
-                f"block has {block.cols} columns, result needs {job.cols}"
+                f"tile at column {col_offset} of width {tile.cols} does not fit a "
+                f"{job.cols}-column result"
             )
-        start = offset * job.cols
-        data[start : start + block.rows * job.cols] = block.data
-        for row in range(offset, offset + block.rows):
-            covered[row] = 1
+        for index in range(tile.rows):
+            start = (row_offset + index) * job.cols + col_offset
+            data[start : start + tile.cols] = tile.data[
+                index * tile.cols : (index + 1) * tile.cols
+            ]
+            for column in range(col_offset, col_offset + tile.cols):
+                covered[(row_offset + index) * job.cols + column] = 1
 
-    missing = [index for index, seen in enumerate(covered) if not seen]
+    missing = covered.count(0)
     if missing:
+        first = covered.index(0)
         raise AssemblyError(
-            f"{len(missing)} of {job.rows} rows never came back "
-            f"(first missing row {missing[0]})"
+            f"{missing} of {job.rows * job.cols} cells never came back "
+            f"(first missing at row {first // job.cols}, column {first % job.cols})"
         )
     return Matrix(rows=job.rows, cols=job.cols, data=data)
 
@@ -210,13 +312,18 @@ def reference(a: Matrix, b: Matrix) -> Matrix:
     and assembly were right — not that two different algorithms happen to agree.
     """
     kernel = kernels.get(kernels.MATMUL_BLOCK)
+    operands = {a.digest(): a, b.digest(): b}
     payload = {
-        "a_block": a.to_payload(),
+        "a_hash": a.digest(),
+        "a_rows": a.rows,
+        "a_cols": a.cols,
         "b_hash": b.digest(),
+        "b_rows": b.rows,
         "b_cols": b.cols,
         "row_offset": 0,
+        "col_offset": 0,
     }
-    output = kernel.run(payload, lambda _hash: b)
+    output = kernel.run(payload, lambda digest: operands[digest])
     return Matrix.from_payload(output["c_block"])
 
 
@@ -228,6 +335,7 @@ def progress(store: Store, job: MatmulJob) -> dict[str, Any]:
     done = counts.get(STATUS_COMPLETED, 0)
     return {
         "blocks": len(job.task_ids),
+        "tiles": len(job.task_ids),
         "completed": done,
         "by_status": counts,
         "percent": round(100.0 * done / max(1, len(job.task_ids)), 1),
@@ -252,26 +360,26 @@ def load_job(store: Store, job_id: str) -> MatmulJob:
         raise AssemblyError(f"job {job_id} holds no matmul blocks")
 
     height = 0
+    width = 0
     inner = 0
-    cols = 0
-    b_hash = ""
     block_rows = 0
+    block_cols = 0
     for task in blocks:
         payload = task.payload
-        block = Matrix.from_payload(payload["a_block"])
-        offset = int(payload["row_offset"])
-        height = max(height, offset + block.rows)
-        block_rows = max(block_rows, block.rows)
-        inner = block.cols
+        rows = int(payload["a_rows"])
         cols = int(payload["b_cols"])
-        b_hash = str(payload["b_hash"])
+        height = max(height, int(payload["row_offset"]) + rows)
+        width = max(width, int(payload["col_offset"]) + cols)
+        block_rows = max(block_rows, rows)
+        block_cols = max(block_cols, cols)
+        inner = int(payload["a_cols"])
 
     return MatmulJob(
         job_id=job_id,
         rows=height,
         inner=inner,
-        cols=cols,
-        b_hash=b_hash,
+        cols=width,
         block_rows=block_rows,
+        block_cols=block_cols,
         task_ids=[t.task_id for t in blocks],
     )

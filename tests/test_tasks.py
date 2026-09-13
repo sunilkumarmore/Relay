@@ -63,12 +63,29 @@ def test_operand_that_lies_about_its_size_is_refused():
 # -- kernels ----------------------------------------------------------------
 
 
+def tile_payload(a: Matrix, b: Matrix, *, row_offset: int = 0, col_offset: int = 0) -> dict:
+    return {
+        "a_hash": a.digest(),
+        "a_rows": a.rows,
+        "a_cols": a.cols,
+        "b_hash": b.digest(),
+        "b_rows": b.rows,
+        "b_cols": b.cols,
+        "row_offset": row_offset,
+        "col_offset": col_offset,
+    }
+
+
+def resolver(*matrices: Matrix):
+    table = {matrix.digest(): matrix for matrix in matrices}
+    return lambda digest: table[digest]
+
+
 def test_matmul_block_computes_the_right_answer():
     a = Matrix.from_rows([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     b = Matrix.from_rows([[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]])
     output = kernels.get(kernels.MATMUL_BLOCK).run(
-        {"a_block": a.to_payload(), "b_hash": b.digest(), "b_cols": 3, "row_offset": 0},
-        lambda _h: b,
+        tile_payload(a, b), resolver(a, b)
     )
     assert Matrix.from_payload(output["c_block"]).to_rows() == [
         [27.0, 30.0, 33.0],
@@ -81,10 +98,10 @@ def test_matmul_is_reproducible_bit_for_bit():
     """The whole basis for verifying a provider by re-running its work. If this
     fails, redundant execution would slash honest providers."""
     a, b = random_matrix(9, 7, seed=3), random_matrix(7, 6, seed=4)
-    payload = {"a_block": a.to_payload(), "b_hash": b.digest(), "b_cols": 6, "row_offset": 0}
+    payload = tile_payload(a, b)
     kernel = kernels.get(kernels.MATMUL_BLOCK)
-    first = kernel.run(payload, lambda _h: b)
-    second = kernel.run(payload, lambda _h: b)
+    first = kernel.run(payload, resolver(a, b))
+    second = kernel.run(payload, resolver(a, b))
     assert kernels.output_hash(first) == kernels.output_hash(second)
     assert Matrix.from_payload(first["c_block"]).raw() == Matrix.from_payload(second["c_block"]).raw()
 
@@ -93,18 +110,19 @@ def test_matmul_refuses_operands_that_do_not_conform():
     a = random_matrix(3, 4, seed=5)
     b = random_matrix(5, 2, seed=6)  # 5 rows against a's 4 columns
     with pytest.raises(kernels.TaskError):
-        kernels.get(kernels.MATMUL_BLOCK).run(
-            {"a_block": a.to_payload(), "b_hash": b.digest(), "b_cols": 2, "row_offset": 0},
-            lambda _h: b,
-        )
+        kernels.get(kernels.MATMUL_BLOCK).run(tile_payload(a, b), resolver(a, b))
+
+
+def test_a_tile_whose_operand_is_not_the_shape_it_declares_is_refused():
+    a, b = random_matrix(3, 4, seed=20), random_matrix(4, 5, seed=21)
+    payload = tile_payload(a, b) | {"a_rows": 99}
+    with pytest.raises(kernels.TaskError, match="resolves to"):
+        kernels.get(kernels.MATMUL_BLOCK).run(payload, resolver(a, b))
 
 
 def test_work_units_are_derived_from_the_payload():
-    a = random_matrix(4, 5, seed=7)
-    units = kernels.get(kernels.MATMUL_BLOCK).work_units(
-        {"a_block": a.to_payload(), "b_hash": "0" * 64, "b_cols": 6, "row_offset": 0}
-    )
-    assert units == 4 * 5 * 6
+    a, b = random_matrix(4, 5, seed=7), random_matrix(5, 6, seed=22)
+    assert kernels.get(kernels.MATMUL_BLOCK).work_units(tile_payload(a, b)) == 4 * 5 * 6
 
 
 def test_text_and_reduce_kernels():
@@ -358,10 +376,14 @@ def test_a_failing_task_still_produces_a_signed_result():
         job_id="j",
         task_type=kernels.MATMUL_BLOCK,
         payload={
-            "a_block": random_matrix(2, 2, seed=11).to_payload(),
-            "b_hash": "0" * 64,
+            "a_hash": "0" * 64,
+            "a_rows": 2,
+            "a_cols": 2,
+            "b_hash": "1" * 64,
+            "b_rows": 2,
             "b_cols": 2,
             "row_offset": 0,
+            "col_offset": 0,
         },
     )
     result = TaskExecutor(provider, store).execute(task)
@@ -451,6 +473,58 @@ def test_a_job_missing_blocks_is_never_assembled_into_a_plausible_wrong_answer()
         matmul.assemble(store, job)
 
 
-def test_block_size_leaves_headroom_for_a_slower_machine():
+def test_tile_size_leaves_headroom_for_a_slower_machine():
     rows = matmul.suggest_block_rows(inner=100, cols=100, max_seconds=60)
     assert rows * 100 * 100 <= matmul.ASSUMED_UNITS_PER_SECOND * 60
+
+
+def test_operand_strips_stay_small_enough_to_move():
+    """At inner=4200 a tile sized purely by the clock wants a 38MB strip of A,
+    which is not something to push through a database row or hold on a phone."""
+    for inner in (240, 1200, 4200):
+        cols = matmul.suggest_block_cols(inner=inner)
+        rows = matmul.suggest_block_rows(inner=inner, cols=cols, max_seconds=300)
+        assert rows * inner * 8 <= matmul.MAX_STRIP_BYTES
+        assert inner * cols * 8 <= matmul.MAX_STRIP_BYTES
+
+
+def test_a_big_job_is_cut_into_enough_tiles_to_spread_over_a_fleet():
+    """Sized by a fraction of the deadline instead of a target duration, a
+    2400-cube job came out as a handful of tiles and most devices sat idle."""
+    inner = 2400
+    cols = matmul.suggest_block_cols(inner=inner)
+    rows = matmul.suggest_block_rows(inner=inner, cols=cols, max_seconds=300)
+    tiles = -(-2400 // rows) * -(-2400 // cols)
+    assert tiles >= 100
+
+
+def test_a_job_tiles_in_both_directions():
+    store = MemoryStore()
+    queue = TaskQueue(store)
+    a, b = random_matrix(20, 8, seed=30), random_matrix(8, 20, seed=31)
+    job = matmul.submit_matmul(
+        queue, Identity.generate(), a=a, b=b, block_rows=7, block_cols=6
+    )
+    assert len(job.task_ids) == 3 * 4
+
+    drain(queue, [TaskExecutor(Identity.generate(), store) for _ in range(3)])
+    assert matmul.assemble(store, job).raw() == matmul.reference(a, b).raw()
+
+
+def test_assembly_reports_a_hole_in_the_middle_of_the_grid():
+    """A tile missing from the interior must not leave zeros that look like an
+    answer."""
+    store = MemoryStore()
+    queue = TaskQueue(store)
+    a, b = random_matrix(12, 4, seed=32), random_matrix(4, 12, seed=33)
+    job = matmul.submit_matmul(
+        queue, Identity.generate(), a=a, b=b, block_rows=6, block_cols=6
+    )
+    executor = TaskExecutor(Identity.generate(), store)
+    for _ in range(3):
+        task = queue.claim(
+            provider_node_id=executor.identity.node_id, task_types=[kernels.MATMUL_BLOCK]
+        )
+        queue.complete(executor.execute(task), provider_node_id=executor.identity.node_id)
+    with pytest.raises(matmul.AssemblyError, match="never came back"):
+        matmul.assemble(store, job)
