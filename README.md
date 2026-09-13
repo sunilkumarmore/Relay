@@ -2,13 +2,27 @@
 
 Relay is a peer-to-peer marketplace for AI compute.
 
-**Providers** sell inference. **Consumers** buy it to run agents. Settlement runs
-on signed receipts, and a job survives losing either the machine running it or
-the provider serving it.
+**Providers** sell inference and *tasks*. **Consumers** buy them to run agents.
+Settlement runs on signed receipts, and a job survives losing either the machine
+running it or the provider serving it.
 
 The load-bearing idea is that an agent's progress lives outside the process
 running it. That is what makes the process disposable — and a disposable process
 is a rentable one. If you cannot evict a tenant safely, you cannot rent to them.
+
+**Selling inference needs a GPU and a model. Selling tasks needs neither.** A
+task is the work between an agent's thinking steps — multiplying a block of a
+matrix, transforming text, reducing numbers — and any machine that runs Python
+and can reach the internet can do it. There is no server on a provider and no
+port to open: a node polls for work, leases it, does it, and posts a signed
+result, all outbound. That is what puts a laptop, a Raspberry Pi or a phone on
+the supply side.
+
+```bash
+python -m relay.tasks demo     # a matmul split across devices, one killed mid-job
+```
+
+See **[docs/DEMO.md](docs/DEMO.md)** to run it across your own machines.
 
 ## How it fits together
 
@@ -384,6 +398,57 @@ Selection policies are `cheapest` (default), `fastest`, `round_robin` and
   adjudicated; subjective quality disputes are recorded and surfaced.
 - **Tool use.** The agent carries `tool_state` through checkpoints, but nothing
   calls tools yet.
+
+## Selling tasks from a device with no GPU
+
+```bash
+# .env needs only SUPABASE_URL and SUPABASE_KEY
+python -m relay.tasks node
+```
+
+The node advertises what its operator has allowed — by default `matmul_block`,
+`text_transform` and `data_reduce`, all pure arithmetic on data carried inside
+the task, touching no filesystem and no network. `python_exec` runs code written
+by whoever signed the task; it is **off unless you turn it on**, and turning it
+on prints a warning explaining that its resource limits stop a task exhausting
+your machine but do not stop it reading files your user account can read. It is
+not a security sandbox.
+
+Failure handling is a single mechanism. A node holds a *lease* on the work it is
+doing and renews it while it works. A device that is switched off, loses signal
+or is killed stops renewing; the lease lapses, the work returns to the queue, and
+another device takes it. Nothing detects the death — the absence is the signal.
+There is no scheduler process either: every node returns other nodes' expired
+leases as a side effect of asking for its own work.
+
+Ordering work:
+
+```bash
+python -m relay.tasks submit  --rows 2400 --inner 2400 --cols 2400 --seed 7
+python -m relay.tasks status  <job-id>
+python -m relay.tasks collect <job-id> --seed 7
+```
+
+`collect` recomputes the whole multiplication locally from the seed and compares
+it to what the devices returned, byte for byte. It refuses to assemble a job with
+a tile missing rather than returning a plausible wrong matrix.
+
+### Why the arithmetic is deliberately slow
+
+The kernel is pure Python and would be far faster with numpy. It does not use
+numpy because BLAS reorders and blocks its arithmetic for speed, so two builds
+can disagree in the last bit of a float. Pure Python floats are IEEE-754 doubles
+whose `*` and `+` are correctly rounded, so a fixed accumulation order gives
+**identical bytes on every machine**.
+
+That is what makes a provider checkable at all: an audit re-runs a tile
+elsewhere and compares hashes, and it can only mean something if honest machines
+are required to agree. Speed is traded for the ability to verify the work.
+
+The same reasoning is why `python_exec` is marked non-deterministic and is never
+audited by hash comparison — two honest providers on different Python patch
+releases diverge routinely, and slashing on that would punish people for keeping
+their machines updated.
 
 ## Development
 
