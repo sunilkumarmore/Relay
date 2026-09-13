@@ -464,6 +464,18 @@ Run it as `pytest`, the way CI does — not `python -m pytest`, which silently
 adds the working directory to `sys.path` and can hide an import that only
 resolves locally.
 
+The same trap runs the other way for ruff. CI installs the pinned
+`ruff==0.3.5` from the dev extras, and a newer ruff on your `PATH` will not
+agree with it: rules get renamed, retired, or changed between versions, so a
+clean local run can still fail CI. Check which one you are getting:
+
+```bash
+ruff --version            # whatever is on PATH
+python -m ruff --version  # the pinned one, which is what CI runs
+```
+
+If they differ, lint with `python -m ruff check .`.
+
 The test suite needs no Supabase project, no Ollama, and no network. Two
 substitutions make that possible:
 

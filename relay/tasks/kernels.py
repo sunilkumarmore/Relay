@@ -234,7 +234,7 @@ class DataReduce:
         if op not in _REDUCE_OPS:
             raise TaskError(f"unknown reduce operation {op!r}")
         for value in values:
-            if not isinstance(value, (int, float)) or isinstance(value, bool):
+            if not isinstance(value, int | float) or isinstance(value, bool):
                 raise TaskError(f"values must be numbers, found {type(value).__name__}")
 
     def run(self, payload: dict[str, Any], resolve: Resolver) -> dict[str, Any]:
