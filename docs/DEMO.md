@@ -113,8 +113,13 @@ python -m relay.tasks collect 4f2a… --seed 7
 
 ```
 assembled 2400x2400
+settled 384 receipt(s) for 138.24 credits
 verified: bit-identical to the same multiplication on one machine
 ```
+
+Nodes are free by default. Set `RELAY_PRICE_PER_MEGA_UNIT` on a provider to
+charge, and fund the consumer's account first — `collect` checks every bill
+against the offer that quoted it and refuses any that does not match.
 
 ### 6. Pull the plug
 
@@ -188,8 +193,10 @@ traded for the ability to verify the work at all.
   iPhone does not. The protocol is plain HTTPS against PostgREST plus Ed25519
   signing, so an iOS client is a small app rather than a port — but it is not
   written.
-- **No payment.** Credits move on an internal ledger. There is no rail to real
-  money.
+- **No rail to real money.** Credits move on an internal ledger and settle
+  properly — each node publishes a signed offer, bills for every tile, and
+  `collect` countersigns and pays out of the job's hold. What does not exist is
+  the bridge between a credit and a currency.
 - **No sandbox for arbitrary code.** `python_exec` is off by default and is not
   a security boundary. WASM is the answer and is not built.
 - **Only independent work fans out.** Matrix rows are independent, which is why

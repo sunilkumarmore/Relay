@@ -169,11 +169,19 @@ the last of those remains the most valuable missing artifact.
   port — but writing it was not this work.
 - **No real sandbox.** `python_exec` has resource limits, not a security
   boundary, and is off by default. WASM is the answer and remains unbuilt.
-- **No payment rail.** Credits are internal.
-- **Verification is not wired to slashing.** `verify.py` reaches a verdict and
-  produces evidence; connecting a conclusive `output_divergence` to
-  `disputes.py` and the existing slash is a small, deliberate gap — it puts real
-  money at risk on a mechanism that has never run against a real fleet.
+- **No payment rail.** Credits are internal. The economic loop is otherwise
+  closed: a node publishes a signed offer, bills for each tile it finishes, and
+  the consumer countersigns and settles out of the job's hold when it collects.
+  Verified end to end — two providers each earned 2.16 credits on a 12-tile job,
+  every receipt acknowledged, ledger invariant intact. What is missing is the
+  rail between a credit and a pound, not the accounting.
+- **Divergence is wired to slashing, with a deliberate brake.** A conclusive
+  minority is disputed and slashed through the existing mechanism. A two-way
+  disagreement is `UNADJUDICATED` and costs nobody anything. The adjudicator
+  recomputes the verdict from the stored results rather than reading it out of
+  the dispute, because the evidence was filed by one of the parties — tested by
+  having a malicious consumer accuse an honest provider with fabricated
+  evidence, which is rejected.
 - **Still no Supabase code path has ever executed.** Every test runs on
   `MemoryStore` or `FileStore`. `SupabaseStore`, migration 009's policies, and
   the `relay_tasks` RLS rules are unverified against a real Postgres. This was

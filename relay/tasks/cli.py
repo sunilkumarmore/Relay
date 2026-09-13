@@ -101,6 +101,61 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def settle_job(store: Store, identity: Identity, job_id: str) -> dict[str, Any]:
+    """Countersign and pay the receipts the providers left for this job.
+
+    Providers file their bills unacknowledged as they finish. The consumer
+    checks each one against the offer it was quoted and the task it signed, then
+    countersigns and settles. A bill that does not check out is marked disputed
+    and left unpaid rather than quietly dropped, so the provider can see why.
+    """
+    from relay.ledger import Ledger
+    from relay.provider.offers import Offer
+    from relay.receipts import WORK_TASK, Receipt
+    from relay.tasks import billing
+    from relay.tasks.model import Task, TaskResult
+
+    ledger = Ledger(store)
+    offers = {row["offer_id"]: Offer.from_row(row) for row in store.list_offers()}
+    tasks = {row["task_id"]: Task.from_row(row) for row in store.list_tasks(job_id=job_id)}
+    results: dict[str, TaskResult] = {}
+    for row in store.list_task_results(job_id=job_id):
+        result = TaskResult.from_row(row)
+        task = tasks.get(result.task_id)
+        if task is not None and result.provider_node_id == task.completed_by:
+            results[result.task_id] = result
+
+    tally = {"paid": 0, "credits": 0.0, "refused": 0, "unquoted": 0}
+    for row in store.list_receipts(job_id=job_id, limit=100000):
+        receipt = Receipt.from_row(row)
+        if receipt.work_kind != WORK_TASK or receipt.is_acknowledged:
+            continue
+        task = tasks.get(receipt.task_id)
+        result = results.get(receipt.task_id)
+        offer = offers.get(receipt.offer_id)
+        if task is None or result is None:
+            tally["refused"] += 1
+            continue
+        if offer is None:
+            # The offer expired before we came to collect. Without the quote we
+            # cannot check the price, and paying an unverifiable bill is worse
+            # than leaving it for the provider to raise.
+            tally["unquoted"] += 1
+            continue
+        try:
+            paid = billing.accept_and_settle(
+                store, ledger, identity,
+                receipt=receipt, task=task, result=result, offer=offer,
+            )
+        except billing.BillingError:
+            tally["refused"] += 1
+            continue
+        tally["paid"] += 1
+        tally["credits"] += paid.amount_credits
+    tally["credits"] = round(tally["credits"], 6)
+    return tally
+
+
 def cmd_collect(args: argparse.Namespace) -> int:
     store = _store(args)
     job = matmul.load_job(store, args.job_id)
@@ -121,6 +176,15 @@ def cmd_collect(args: argparse.Namespace) -> int:
 
     result = matmul.assemble(store, job)
     print(f"assembled {result.rows}x{result.cols}")
+
+    if not args.no_settle:
+        tally = settle_job(store, _identity(args), job.job_id)
+        if tally["paid"] or tally["refused"] or tally["unquoted"]:
+            print(
+                f"settled {tally['paid']} receipt(s) for {tally['credits']} credits"
+                + (f", refused {tally['refused']}" if tally["refused"] else "")
+                + (f", {tally['unquoted']} without a live quote" if tally["unquoted"] else "")
+            )
 
     if args.seed is not None:
         a, b = build_operands(job.rows, job.inner, job.cols, args.seed)
@@ -279,6 +343,10 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--wait", type=int, default=600, help="seconds to wait for stragglers")
     collect.add_argument("--poll", type=int, default=5)
     collect.add_argument("--out", default=None, help="write the result matrix here")
+    collect.add_argument("--key-file", default=None)
+    collect.add_argument(
+        "--no-settle", action="store_true", help="assemble without paying the receipts"
+    )
     collect.set_defaults(func=cmd_collect)
 
     node = sub.add_parser("node", help="run a provider on this machine")

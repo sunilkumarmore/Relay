@@ -11,6 +11,11 @@ recorded in the checkpoint. Decidable by recomputing the hashes.
 *Token over-claim.* The receipt bills for more tokens than the recorded text can
 account for. Decidable by re-counting.
 
+*Output divergence.* Several providers ran the same deterministic task and this
+one is in the minority. Decidable by comparing hashes each of them signed —
+and only where the task type guarantees that honest machines agree, which rules
+out anything running consumer-supplied code.
+
 Everything else is recorded, surfaced, and left to the humans. An upheld dispute
 refunds the consumer and slashes the provider; a rejected one means the consumer
 pays after all — disputing has to cost something, or it is free to cry wolf.
@@ -35,9 +40,14 @@ UNADJUDICATED = "unadjudicated"
 
 REASON_HASH_MISMATCH = "hash_mismatch"
 REASON_TOKEN_OVERCLAIM = "token_overclaim"
+REASON_OUTPUT_DIVERGENCE = "output_divergence"
 REASON_OTHER = "other"
 
-OBJECTIVE_REASONS = (REASON_HASH_MISMATCH, REASON_TOKEN_OVERCLAIM)
+OBJECTIVE_REASONS = (
+    REASON_HASH_MISMATCH,
+    REASON_TOKEN_OVERCLAIM,
+    REASON_OUTPUT_DIVERGENCE,
+)
 
 # What an upheld dispute costs the provider on top of the refund, as a multiple
 # of the disputed amount. Small enough not to be ruinous, large enough that
@@ -125,6 +135,9 @@ def adjudicate(store: Store, ledger: Ledger, dispute: Dispute) -> Dispute:
     if not receipt.provider_signature_is_valid():
         return _uphold(store, ledger, dispute, receipt, {"finding": "provider signature invalid"})
 
+    if dispute.reason == REASON_OUTPUT_DIVERGENCE:
+        return _adjudicate_divergence(store, ledger, dispute, receipt)
+
     step = _recorded_step(store, receipt)
     if step is None:
         return _resolve(
@@ -165,6 +178,65 @@ def adjudicate(store: Store, ledger: Ledger, dispute: Dispute) -> Dispute:
     if findings:
         return _uphold(store, ledger, dispute, receipt, findings)
     return _resolve(store, dispute, REJECTED, {"finding": "token counts are within tolerance"})
+
+
+def _adjudicate_divergence(
+    store: Store, ledger: Ledger, dispute: Dispute, receipt: Receipt
+) -> Dispute:
+    """Rule on a task whose providers disagreed.
+
+    The verdict is recomputed from the stored results rather than read out of
+    the dispute, because the evidence was filed by one of the parties. Whoever
+    opened the dispute does not get to say who lost it.
+    """
+    from relay.tasks import verify as task_verify
+    from relay.tasks.model import Task
+
+    if not receipt.task_id:
+        return _resolve(
+            store, dispute, REJECTED, {"finding": "receipt names no task to compare"}
+        )
+    row = store.get_task(receipt.task_id)
+    if row is None:
+        return _resolve(store, dispute, REJECTED, {"finding": "no such task"})
+
+    task = Task.from_row(row)
+    audits = [
+        str(other["task_id"])
+        for other in store.list_tasks(job_id=task.job_id, limit=100000)
+        if other.get("audit_of") == task.task_id
+    ]
+    outcome = task_verify.compare(store, task=task, audit_task_ids=audits)
+    findings = task_verify.evidence_for(store, outcome)
+
+    if outcome.verdict == task_verify.VERDICT_NOT_AUDITABLE:
+        # Two honest providers are not required to agree on this task type, so
+        # disagreeing proves nothing about either of them.
+        return _resolve(
+            store,
+            dispute,
+            UNADJUDICATED,
+            {**findings, "finding": "task type is not deterministic; divergence proves nothing"},
+        )
+    if outcome.verdict == task_verify.VERDICT_AGREED:
+        return _resolve(store, dispute, REJECTED, {**findings, "finding": "providers agree"})
+    if not outcome.is_conclusive:
+        # Somebody is wrong and the evidence does not say who. Convicting either
+        # would make an honest provider's stake a coin flip.
+        return _resolve(
+            store,
+            dispute,
+            UNADJUDICATED,
+            {**findings, "finding": "no majority; which provider is wrong is undecided"},
+        )
+    if receipt.provider_node_id not in outcome.minority:
+        return _resolve(
+            store,
+            dispute,
+            REJECTED,
+            {**findings, "finding": "this provider is in the majority"},
+        )
+    return _uphold(store, ledger, dispute, receipt, findings)
 
 
 def _uphold(
