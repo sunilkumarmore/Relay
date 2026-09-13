@@ -6,8 +6,8 @@ marketplace. Each phase below is a **prompt to paste into a fresh Claude Code se
 
 ## Status
 
-Phases 0-6 are **built**. Phase 7 (CLI and web surfaces) and Phase 8
-(hardening) are still prompts.
+Phases 0-6.5 are **built**, and so is the task-dispatch pivot that came after
+them. Phase 7 (CLI and web surfaces) and Phase 8 (hardening) are still prompts.
 
 | Phase | State | What landed |
 |---|---|---|
@@ -19,12 +19,26 @@ Phases 0-6 are **built**. Phase 7 (CLI and web surfaces) and Phase 8
 | 5 Reputation | done | Deterministic scores, adjudicated disputes, stake and slashing |
 | 6 Stateful agent | done | Context between steps, hashed agent state, compaction, dependencies |
 | 6.5 Token authority | done | The JWT exchange migration 002 assumed but never had, plus write policies scoped to the session owner |
+| Pivot: task dispatch | done | Pull queue with leases, deterministic kernels, 2D-tiled matmul, operator consent, verification, settlement |
 | 7 Surfaces | **next** | `relay` CLI, web market dashboard, docker compose |
 | 8 Hardening | pending | TLS, rate limits, metrics, chaos runs |
 
 With Phase 6 in, Relay is a resumable *agent* rather than a resumable queue:
 steps share one conversation, quote each other's answers, and a run killed
 without warning resumes into the same conversation it would have had.
+
+**The pivot was not in this plan and it changes what the marketplace sells.**
+Selling inference needs a GPU and a model; selling *tasks* — the arithmetic
+between an agent's thinking steps — needs neither, which puts an ordinary
+laptop or phone on the supply side. Providers pull work rather than being
+called, so no provider opens a port. The planned dial-out broker was cancelled
+before it was built: polling achieves the same with less machinery.
+
+It also cancelled a piece of this plan's economics. Task pricing needs no
+analogue of the token over-claim dispute, because `work_units` is fixed by the
+task's own payload and re-derived by the queue — there is no quantity for a
+provider to inflate, only an answer that can be wrong. See `docs/pivot/` for the
+prior-art study, the audit, and the findings.
 
 Phase 6.5 was not in the original plan. Migration 002 wrote RLS policies against
 a JWT claim that nothing in the codebase produced, so applying it would have
@@ -35,8 +49,9 @@ loose enough that any node could rewrite any other session. Both are fixed in
 The largest remaining gap is not a phase: **no Supabase code path has ever
 executed.** Every test runs against MemoryStore or FileStore. `SupabaseStore`,
 the `on_conflict` clauses, the ledger trigger and the RLS policies are all
-unverified. Integration tests against a local `supabase start` stack should come
-before Phase 7.
+unverified — and migration 009's task tables and policies are now unverified in
+the same way. Integration tests against a local `supabase start` stack should
+come before Phase 7.
 
 ## How to use this document
 
