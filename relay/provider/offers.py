@@ -1,9 +1,16 @@
 """Offers — what a provider advertises, and what it commits to.
 
-An offer is a signed statement: *this node, at this endpoint, will serve this
-model, with this context window, at this price, up to this concurrency, until
-this time.* Signing matters because the offer is also the price quote a consumer
-later checks its receipts against (Phase 4). An unsigned offer is a rumour.
+An offer is a signed statement: *this node, at this endpoint, will do this kind
+of work, at this price, up to this concurrency, until this time.* Signing matters
+because the offer is also the price quote a consumer later checks its receipts
+against (Phase 4). An unsigned offer is a rumour.
+
+Two kinds of work fit through the same structure. An inference offer names a
+model, a context window, and a price per thousand tokens. A task offer names the
+task types it will run and a price per million work units. A node may advertise
+both, one, or — for a phone with no model on it — only tasks. The inference
+fields default to empty rather than being required, which is the whole change
+the task pivot needed here.
 
 Offers expire. A provider that stops republishing drops out of the directory on
 its own, so a dead node cannot keep advertising capacity it no longer has.
@@ -34,6 +41,10 @@ SIGNED_FIELDS = (
     "context_window",
     "price_in_per_1k",
     "price_out_per_1k",
+    "task_types",
+    "price_per_mega_unit",
+    "price_per_task",
+    "max_payload_bytes",
     "max_concurrency",
     "region",
     "capabilities",
@@ -60,10 +71,17 @@ class Offer(BaseModel):
     offer_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     provider_node_id: str
     endpoint_url: str
-    model: str
-    context_window: int
-    price_in_per_1k: float
-    price_out_per_1k: float
+    model: str = ""
+    context_window: int = 0
+    price_in_per_1k: float = 0.0
+    price_out_per_1k: float = 0.0
+    # Task work. `task_types` is the capability gate; the two prices are the
+    # quote. Per-unit is the honest one — work units are fixed by the task, so
+    # neither side can argue about the quantity afterwards.
+    task_types: tuple[str, ...] = ()
+    price_per_mega_unit: float = 0.0
+    price_per_task: float = 0.0
+    max_payload_bytes: int = 0
     max_concurrency: int = 1
     region: str = "unknown"
     capabilities: dict[str, Any] = Field(default_factory=dict)
@@ -106,10 +124,24 @@ class Offer(BaseModel):
 
     # -- pricing ----------------------------------------------------------
     def price(self, tokens_in: int, tokens_out: int) -> float:
-        """Cost in credits for one call. Rounded to a millicredit so both sides
-        arrive at the same number from the same inputs."""
+        """Cost in credits for one inference call. Rounded to a millicredit so
+        both sides arrive at the same number from the same inputs."""
         raw = (tokens_in / 1000.0) * self.price_in_per_1k + (tokens_out / 1000.0) * self.price_out_per_1k
         return round(raw, 6)
+
+    def task_price(self, work_units: int) -> float:
+        """Cost in credits for one task.
+
+        `work_units` comes off the task, where the consumer signed it and the
+        queue re-derived it from the payload. So unlike a token count, it is not
+        something the provider reports and nobody can check — which is why there
+        is no task equivalent of the token over-claim dispute.
+        """
+        raw = self.price_per_task + (work_units / 1_000_000.0) * self.price_per_mega_unit
+        return round(raw, 6)
+
+    def serves_task_type(self, task_type: str) -> bool:
+        return task_type in self.task_types
 
     def to_row(self) -> dict[str, Any]:
         return self.model_dump()
@@ -124,10 +156,14 @@ def build_offer(
     identity: Identity,
     *,
     endpoint_url: str,
-    model: str,
-    context_window: int,
-    price_in_per_1k: float,
-    price_out_per_1k: float,
+    model: str = "",
+    context_window: int = 0,
+    price_in_per_1k: float = 0.0,
+    price_out_per_1k: float = 0.0,
+    task_types: tuple[str, ...] | list[str] = (),
+    price_per_mega_unit: float = 0.0,
+    price_per_task: float = 0.0,
+    max_payload_bytes: int = 0,
     max_concurrency: int = 1,
     region: str = "unknown",
     capabilities: dict[str, Any] | None = None,
@@ -144,6 +180,10 @@ def build_offer(
         context_window=context_window,
         price_in_per_1k=price_in_per_1k,
         price_out_per_1k=price_out_per_1k,
+        task_types=tuple(task_types),
+        price_per_mega_unit=price_per_mega_unit,
+        price_per_task=price_per_task,
+        max_payload_bytes=max_payload_bytes,
         max_concurrency=max_concurrency,
         region=region,
         capabilities=capabilities or {},

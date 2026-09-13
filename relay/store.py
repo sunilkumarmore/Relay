@@ -1823,6 +1823,10 @@ class MemoryStore:
         with self._txn():
             for row in self.tables["operands"]:
                 if row["operand_hash"] == operand_hash:
+                    # Overwrite rather than keep. Anyone may publish an operand,
+                    # so a node could have parked garbage under this address
+                    # before the honest publisher arrived; the honest bytes win.
+                    row["payload"] = payload
                     return
             self.tables["operands"].append(
                 {"operand_hash": operand_hash, "payload": payload, "created_at": now_iso()}

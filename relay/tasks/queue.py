@@ -74,19 +74,26 @@ def now_utc() -> datetime:
     return datetime.now(UTC)
 
 
-def assert_lease_sane(lease_seconds: int, max_task_seconds: int) -> None:
+def assert_lease_sane(
+    lease_seconds: int, max_task_seconds: int, slack_seconds: int = LEASE_SLACK_SECONDS
+) -> None:
     """Refuse to start rather than double-paying later.
 
-    This is a startup check and not a comment because a comment does not stop
-    a deployment. The failure it prevents is silent: the queue re-issues work
-    that is still running, both providers finish, and both invoice.
+    This is a startup check and not a comment because a comment does not stop a
+    deployment. The failure it prevents is silent: the queue re-issues work that
+    is still running, both providers finish, and both invoice.
+
+    `slack_seconds` covers clock skew between the provider and the database plus
+    the round trip carrying the result. It is lowered only where both are known
+    to be negligible — a test driving several processes on one machine — and the
+    default is what any real deployment gets.
     """
-    if lease_seconds < max_task_seconds + LEASE_SLACK_SECONDS:
+    if lease_seconds < max_task_seconds + slack_seconds:
         raise LeaseConfigError(
             f"lease of {lease_seconds}s cannot cover a task allowed {max_task_seconds}s "
-            f"plus {LEASE_SLACK_SECONDS}s of slack. A lease that expires while its task "
+            f"plus {slack_seconds}s of slack. A lease that expires while its task "
             f"is still running gets the work issued twice and billed twice. "
-            f"Raise the lease to at least {max_task_seconds + LEASE_SLACK_SECONDS}s, "
+            f"Raise the lease to at least {max_task_seconds + slack_seconds}s, "
             f"or lower the task's max_seconds."
         )
 
@@ -100,11 +107,13 @@ class TaskQueue:
         *,
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
         max_task_seconds: int = task_model.DEFAULT_MAX_SECONDS,
+        lease_slack_seconds: int = LEASE_SLACK_SECONDS,
     ) -> None:
-        assert_lease_sane(lease_seconds, max_task_seconds)
+        assert_lease_sane(lease_seconds, max_task_seconds, lease_slack_seconds)
         self.store = store
         self.lease_seconds = lease_seconds
         self.max_task_seconds = max_task_seconds
+        self.lease_slack_seconds = lease_slack_seconds
         # Observability from the first commit, not once something goes wrong.
         # Outcomes mirror the ones Darkbloom wished they had had.
         self.counters: Counter[str] = Counter()

@@ -32,6 +32,8 @@ relay-controller = "relay.controller.cli:cli"
 relay-dashboard = "relay.dashboard.tui:run"
 relay-provider = "relay.provider.server:run"
 relay-authority = "relay.authority.server:run"
+relay-node = "relay.tasks.node:run"
+relay-tasks = "relay.tasks.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["relay*"]
@@ -40,6 +42,9 @@ include = ["relay*"]
 testpaths = ["tests"]
 addopts = "-q"
 filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+    "slow: spawns real OS processes and waits on real leases; tens of seconds",
+]
 
 [tool.ruff]
 line-length = 110

@@ -25,11 +25,24 @@ from relay import identity as ident
 from relay.identity import Identity
 from relay.provider.offers import Offer, now_utc
 
+# Receipts are permanent, and a receipt that stops verifying is a debt nobody
+# can prove. So the signed field list is versioned rather than edited: a v1
+# receipt signed before tasks existed still hashes over exactly the fields it
+# was signed over, forever. Offers could simply change theirs — they expire in
+# five minutes — but a receipt has to be checkable years later.
+SCHEMA_V1 = 1
+SCHEMA_V2 = 2
+CURRENT_TASK_SCHEMA = SCHEMA_V2
+
+WORK_INFERENCE = "inference"
+WORK_TASK = "task"
+
 STATUS_UNACKNOWLEDGED = "unacknowledged"
 STATUS_ACKNOWLEDGED = "acknowledged"
 STATUS_DISPUTED = "disputed"
 
-SIGNED_FIELDS = (
+# v1: every receipt issued before the task pivot. Do not edit this tuple.
+SIGNED_FIELDS_V1 = (
     "receipt_id",
     "job_id",
     "step_number",
@@ -48,15 +61,43 @@ SIGNED_FIELDS = (
     "issued_at",
 )
 
+# v2 adds what a non-inference receipt needs. The v1 fields keep their places;
+# a task receipt simply carries zero tokens and an empty model.
+SIGNED_FIELDS_V2 = SIGNED_FIELDS_V1 + (
+    "schema_version",
+    "work_kind",
+    "work_units",
+    "task_id",
+)
+
+SIGNED_FIELDS_BY_VERSION = {
+    SCHEMA_V1: SIGNED_FIELDS_V1,
+    SCHEMA_V2: SIGNED_FIELDS_V2,
+}
+
+# Kept so that existing imports of `SIGNED_FIELDS` still mean what they meant.
+SIGNED_FIELDS = SIGNED_FIELDS_V1
+
 
 def hash_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def request_fingerprint(prompt: str, max_tokens: int, model: str) -> str:
-    """Covers everything that determines what was asked for, so a provider
-    cannot bill for a cheaper request than it received (or vice versa)."""
+    """Covers everything that determines what an inference call was asked for,
+    so a provider cannot bill for a cheaper request than it received (or vice
+    versa)."""
     payload = {"prompt": prompt, "max_tokens": max_tokens, "model": model}
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def task_fingerprint(task_id: str, payload_hash: str, work_units: int) -> str:
+    """The same idea for a task. The consumer already signed `payload_hash` and
+    `work_units` on the task itself, so this ties the receipt to that exact
+    order rather than to a prompt it does not have."""
+    payload = {"task_id": task_id, "payload_hash": payload_hash, "work_units": work_units}
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -68,6 +109,12 @@ def price_for(price_in_per_1k: float, price_out_per_1k: float, tokens_in: int, t
 
 
 class Receipt(BaseModel):
+    # Defaults to v1 so a row written before this column existed verifies
+    # against the fields it was actually signed over.
+    schema_version: int = SCHEMA_V1
+    work_kind: str = WORK_INFERENCE
+    work_units: int = 0
+    task_id: str = ""
     receipt_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     job_id: str
     step_number: int
@@ -91,7 +138,10 @@ class Receipt(BaseModel):
 
     # -- signing ----------------------------------------------------------
     def canonical_bytes(self) -> bytes:
-        payload = {field: getattr(self, field) for field in SIGNED_FIELDS}
+        fields = SIGNED_FIELDS_BY_VERSION.get(self.schema_version)
+        if fields is None:
+            raise ValueError(f"unknown receipt schema version {self.schema_version}")
+        payload = {field: getattr(self, field) for field in fields}
         return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
     def issued_by(self, identity: Identity) -> Receipt:
@@ -116,6 +166,8 @@ class Receipt(BaseModel):
 
     def _valid(self, node_id: str, signature: str) -> bool:
         if not signature:
+            return False
+        if self.schema_version not in SIGNED_FIELDS_BY_VERSION:
             return False
         try:
             raw = bytes.fromhex(signature)

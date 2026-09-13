@@ -232,3 +232,46 @@ def progress(store: Store, job: MatmulJob) -> dict[str, Any]:
         "by_status": counts,
         "percent": round(100.0 * done / max(1, len(job.task_ids)), 1),
     }
+
+
+def load_job(store: Store, job_id: str) -> MatmulJob:
+    """Rebuild a job's shape from the tasks themselves.
+
+    There is no jobs table, deliberately. Every fact about a matmul job — how
+    tall the result is, how wide, which operand it multiplies by — is already
+    stated in the tasks and signed by the consumer. A separate row recording the
+    same facts could disagree with them, and then which one is the job?
+    """
+    rows = store.list_tasks(job_id=job_id, limit=100000)
+    if not rows:
+        raise AssemblyError(f"no tasks found for job {job_id}")
+
+    tasks = [Task.from_row(row) for row in rows]
+    blocks = [t for t in tasks if t.task_type == kernels.MATMUL_BLOCK]
+    if not blocks:
+        raise AssemblyError(f"job {job_id} holds no matmul blocks")
+
+    height = 0
+    inner = 0
+    cols = 0
+    b_hash = ""
+    block_rows = 0
+    for task in blocks:
+        payload = task.payload
+        block = Matrix.from_payload(payload["a_block"])
+        offset = int(payload["row_offset"])
+        height = max(height, offset + block.rows)
+        block_rows = max(block_rows, block.rows)
+        inner = block.cols
+        cols = int(payload["b_cols"])
+        b_hash = str(payload["b_hash"])
+
+    return MatmulJob(
+        job_id=job_id,
+        rows=height,
+        inner=inner,
+        cols=cols,
+        b_hash=b_hash,
+        block_rows=block_rows,
+        task_ids=[t.task_id for t in blocks],
+    )
