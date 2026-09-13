@@ -1,5 +1,17 @@
 goal: "Analyze and summarize a software project"
 
+# Optional. What this job needs from the market. Anything you leave out is not a
+# constraint — with no requirements block at all, the consumer takes the cheapest
+# provider that can serve the job.
+#
+# requirements:
+#   model: llama3
+#   max_price_out_per_1k: 0.20
+#   max_price_in_per_1k: 0.10
+#   min_context_window: 8192
+#   region: home-lab          # a preference, not a filter
+#   budget_credits: 5.0
+
 steps:
   - topic: "Tech stack overview"
     prompt: >
@@ -17,3 +29,18 @@ steps:
     prompt: >
       Write a 10-item production deployment checklist for a Python web
       application. Each item should be actionable and specific.
+
+# Steps can build on each other. Referring to an earlier answer also declares
+# the dependency, so ordering follows from the prompts rather than from the
+# order they happen to be written in.
+#
+#   - topic: "Recommendation"
+#     prompt: >
+#       Given {{ steps.1.solution }} and {{ steps.2.solution }}, recommend a
+#       shipping order with justification.
+#
+# Use depends_on when a step needs an earlier one without quoting it:
+#
+#   - topic: "Synthesis"
+#     depends_on: [1, 2, 3]
+#     prompt: "Summarize everything decided so far."
